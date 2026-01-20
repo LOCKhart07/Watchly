@@ -6,6 +6,7 @@ from typing import Any
 
 from loguru import logger
 
+from app.core.constants import DEFAULT_CATALOG_LIMIT, MAX_CATALOG_ITEMS
 from app.core.settings import UserSettings
 from app.models.taste_profile import TasteProfile
 from app.services.profile.constants import TOP_PICKS_CREATOR_CAP, TOP_PICKS_GENRE_CAP
@@ -44,7 +45,7 @@ class TopPicksService:
         library_items: dict[str, list[dict[str, Any]]],
         watched_tmdb: set[int],
         watched_imdb: set[str],
-        limit: int = 20,
+        limit: int = DEFAULT_CATALOG_LIMIT,
     ) -> list[dict[str, Any]]:
         """
         Get top picks with diversity caps.
@@ -81,9 +82,6 @@ class TopPicksService:
 
         # 1. Fetch recommendations from top items (loved/watched/liked/added)
         rec_candidates = await self._fetch_recommendations_from_top_items(library_items, content_type, mtype)
-        # Apply global settings filter to recommendations
-        # (since TMDB recommendations API doesn't support early filtering)
-        rec_candidates = filter_items_by_settings(rec_candidates, self.user_settings)
         for item in rec_candidates:
             if item.get("id"):
                 all_candidates[item["id"]] = item
@@ -96,6 +94,11 @@ class TopPicksService:
 
         # Filter out watched items
         filtered_candidates = [item for item in all_candidates.values() if item.get("id") not in watched_tmdb]
+
+        # filter by user settings
+        filtered_candidates = filter_items_by_settings(filtered_candidates, self.user_settings)
+
+        logger.info(f"Found {len(filtered_candidates)} candidates after filtering out watched items and user settings")
 
         #  Score all candidates with profile
         scored_candidates = []
@@ -133,11 +136,7 @@ class TopPicksService:
         )
         logger.info(f"Enriched {len(enriched)} items with full metadata")
 
-        # # Apply creator cap (after enrichment, we have full metadata)
-        # final = self._apply_creator_cap(enriched, len(enriched))
-        # logger.info(f"After creator cap: {len(final)} items")
-
-        # Final filter (remove watched by IMDB ID)
+        # Final filter
         filtered = filter_watched_by_imdb(enriched, watched_imdb)
 
         elapsed_time = time.time() - start_time
@@ -146,7 +145,7 @@ class TopPicksService:
             f"(target: {limit}, candidates: {len(all_candidates)}, scored: {len(scored_candidates)})"
         )
 
-        return filtered[:limit]
+        return filtered[:MAX_CATALOG_ITEMS]
 
     async def _fetch_recommendations_from_top_items(
         self,
@@ -187,7 +186,7 @@ class TopPicksService:
             # tasks.append(self.tmdb_service.get_similar(tmdb_id, mtype, page=1))
 
         # Execute all in parallel
-        logger.debug(f"Fetching recommendations from {len(tasks)} top library items")
+        logger.info(f"Fetching recommendations from {len(tasks)} top library items")
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         failed_count = 0
@@ -208,13 +207,9 @@ class TopPicksService:
         """
         Add a discover task to the list of tasks with default parameters.
         """
-        # Get dynamic thresholds
-        min_rating, min_votes = RecommendationFiltering.get_quality_thresholds(self.user_settings)
         sort_by = RecommendationFiltering.get_sort_by_preference(self.user_settings)
         params = {
             "sort_by": sort_by,
-            "vote_count.gte": min_votes,
-            "vote_average.gte": min_rating,
             **kwargs,
         }
         if without_genres:

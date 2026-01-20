@@ -2,6 +2,7 @@ from typing import Any
 
 from loguru import logger
 
+from app.core.constants import DISCOVERY_SETTINGS
 from app.services.recommendation.filtering import RecommendationFiltering
 from app.services.recommendation.metadata import RecommendationMetadata
 
@@ -226,7 +227,7 @@ def build_discover_params(user_settings: Any) -> dict[str, Any]:
     current_year = current_date.year
 
     # 1. Year Range
-    year_min = getattr(user_settings, "year_min", 1980)
+    year_min = getattr(user_settings, "year_min", 1970)
     year_max = getattr(user_settings, "year_max", current_year)
 
     # Apply to both movie and tv date fields for convenience in merging
@@ -240,18 +241,6 @@ def build_discover_params(user_settings: Any) -> dict[str, Any]:
         else:
             params[f"{prefix}.lte"] = f"{year_max}-12-31"
 
-    # 2. Popularity
-    pop_pref = getattr(user_settings, "popularity", "balanced")
-    if pop_pref == "mainstream":
-        params["popularity.gte"] = 50.0
-    elif pop_pref == "balanced":
-        params["popularity.gte"] = 10.0
-    elif pop_pref == "gems":
-        params["popularity.lte"] = 30.0
-        params["vote_count.gte"] = 100
-        params["vote_average.gte"] = 7.0
-    # "all" does nothing
-
     return params
 
 
@@ -264,29 +253,8 @@ def apply_discover_filters(params: dict[str, Any], user_settings: Any) -> dict[s
 
     global_params = build_discover_params(user_settings)
 
-    # 1. Merge Years
-    # We want the intersection of the global range and the specific range.
-    for prefix in ["primary_release_date", "first_air_date"]:
-        # Handle GTE
-        global_gte = global_params.get(f"{prefix}.gte")
-        local_gte = params.get(f"{prefix}.gte")
-        if global_gte and local_gte:
-            # Intersection means taking the later start date
-            params[f"{prefix}.gte"] = max(global_gte, local_gte)
-        elif global_gte:
-            params[f"{prefix}.gte"] = global_gte
+    params = {**global_params, **params}
 
-        # Handle LTE
-        global_lte = global_params.get(f"{prefix}.lte")
-        local_lte = params.get(f"{prefix}.lte")
-        if global_lte and local_lte:
-            # Intersection means taking the earlier end date
-            params[f"{prefix}.lte"] = min(global_lte, local_lte)
-        elif global_lte:
-            params[f"{prefix}.lte"] = global_lte
-
-    # 2. Popularity & Quality (Dynamic)
-    # If local params define filters, respect strictness, but use dynamic defaults otherwise.
     min_rating, min_votes = RecommendationFiltering.get_quality_thresholds(user_settings)
 
     # Apply dynamic thresholds if not overridden by stricter local params
@@ -295,24 +263,6 @@ def apply_discover_filters(params: dict[str, Any], user_settings: Any) -> dict[s
 
     if "vote_average.gte" not in params:
         params["vote_average.gte"] = min_rating
-
-    # Legacy Popularity Handling (still useful for high-level filtering)
-    for key in [
-        "popularity.gte",
-        "popularity.lte",
-        "vote_count.gte",
-        "vote_average.gte",
-    ]:
-        global_val = global_params.get(key)
-        local_val = params.get(key)
-
-        if global_val is not None:
-            if key.endswith(".gte"):
-                # For GTE, take the larger value
-                params[key] = max(global_val, local_val) if local_val is not None else global_val
-            elif key.endswith(".lte"):
-                # For LTE, take the smaller value
-                params[key] = min(global_val, local_val) if local_val is not None else global_val
 
     return params
 
@@ -331,9 +281,6 @@ def filter_items_by_settings(items: list[dict[str, Any]], user_settings: Any) ->
 
     filtered = []
 
-    # Get dynamic thresholds
-    min_rating, min_votes = RecommendationFiltering.get_quality_thresholds(user_settings)
-
     for item in items:
         # 1. Year Filtering
         release_date = item.get("release_date") or item.get("first_air_date")
@@ -345,33 +292,23 @@ def filter_items_by_settings(items: list[dict[str, Any]], user_settings: Any) ->
             except (ValueError, IndexError):
                 pass
 
-        # 2. Popularity/Quality Filtering
-        # Apply the dynamic filters logic
-        pop = item.get("popularity", 0.0)
-        vote_avg = item.get("vote_average", 0.0)
-        vote_count = item.get("vote_count", 0)
-
-        # Basic sanity check (always exclude junk)
-        if vote_count < 5:
+        params = DISCOVERY_SETTINGS.get(pop_pref, {})
+        if not params:
             continue
 
-        # Respect user settings strictly for Gems/Mainstream
-        if pop_pref == "mainstream":
-            if pop < 50.0 or vote_count < min_votes:
+        # determine operations
+        ops = {
+            "gte": lambda x, y: x >= y,
+            "lte": lambda x, y: x <= y,
+        }
+
+        for param in params:
+            t_param, param_ops = param.split(".")
+
+            param_operator = ops.get(param_ops)
+            if not param_operator:
                 continue
-        elif pop_pref == "balanced":
-            if vote_avg < min_rating or vote_count < min_votes:
-                # Allow high popularity items to bypass strict rating slightly
-                if pop > 50.0 and vote_avg >= 6.0:
-                    pass
-                else:
-                    continue
-        elif pop_pref == "gems":
-            if pop > 35.0 or vote_avg < min_rating or vote_count < min_votes:
-                continue
-        elif pop_pref == "all":
-            # Just basic sanity
-            if vote_count < min_votes:
+            if not param_operator(item.get(t_param), params[param]):
                 continue
 
         filtered.append(item)
