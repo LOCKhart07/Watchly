@@ -134,6 +134,7 @@ class DynamicCatalogService:
                 library_items, media_type, None, None
             )
             if not profile:
+                logger.warning(f"Failed to build profile for {media_type}")
                 return media_type, []
 
             try:

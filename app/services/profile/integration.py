@@ -227,7 +227,7 @@ class ProfileIntegration:
                 # Get top genres
                 top_genres = profile.get_top_genres(limit=GENRE_WHITELIST_LIMIT)
                 whitelist = {int(genre_id) for genre_id, _ in top_genres}
-                return whitelist
+            return whitelist
         except Exception as e:
             logger.warning(f"Failed to build genre whitelist for {content_type}: {e}")
             return set()

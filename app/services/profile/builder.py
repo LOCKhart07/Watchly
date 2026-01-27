@@ -132,6 +132,11 @@ class ProfileBuilder:
             profile.average_episodes = total_weighted_episodes / total_weight_for_episodes
 
         profile.processed_items = processed_ids
+
+        if not profile.genre_scores and not profile.keyword_scores:
+            logger.warning(
+                f"Built profile for {content_type} but all scores are empty. Library may have processing issues."
+            )
         return profile
 
     async def _process_item(
