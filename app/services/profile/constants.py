@@ -24,10 +24,6 @@ CAST_POSITION_MINOR: Final[float] = 0.2
 GENRE_POSITION_WEIGHTS: Final[list[float]] = [1.0, 0.8, 0.5]  # First, second, third
 GENRE_MAX_POSITIONS: Final[int] = 3  # Only consider top 3 genres
 
-# Crew Job Weights (directors matter most)
-CREW_JOB_DIRECTOR: Final[float] = 0.7  # more focus on cast then crew
-CREW_JOB_OTHER: Final[float] = 0.1  # All other crew roles
-
 # Score Caps (prevent unbounded growth)
 CAP_GENRE: Final[float] = 50.0
 CAP_KEYWORD: Final[float] = 40.0

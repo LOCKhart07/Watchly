@@ -15,8 +15,6 @@ from app.services.profile.constants import (
     CAP_GENRE,
     CAP_KEYWORD,
     CAP_RUNTIME,
-    CREW_JOB_DIRECTOR,
-    CREW_JOB_OTHER,
     FEATURE_WEIGHT_COUNTRY,
     FEATURE_WEIGHT_CREATOR,
     FEATURE_WEIGHT_ERA,
@@ -221,7 +219,6 @@ class ProfileBuilder:
                 profile.country_scores[country_code] = profile.country_scores.get(country_code, 0.0) + weight
                 frequencies["countries"][country_code] += 1
 
-        # Directors (with job-based weights)
         crew_list = features.get("crew", [])
         if isinstance(crew_list, list):
             for crew_item in crew_list:
@@ -233,20 +230,12 @@ class ProfileBuilder:
                     job = ""
 
                 if crew_id:
-                    # Frequency mapping: use constant base weight instead of evidence_weight
-                    # Boost by small fraction if loved/liked
-                    base_freq = 1.1 if is_loved else 1.0
+                    # Only count actual directors (for movies) and creators (for TV series)
+                    if job in ["director", "creator"]:
+                        weight = evidence_weight * FEATURE_WEIGHT_CREATOR
+                        profile.director_scores[crew_id] = profile.director_scores.get(crew_id, 0.0) + weight
+                        frequencies["directors"][crew_id] += 1
 
-                    # Director gets full weight, others get 0.5
-                    job_weight = (
-                        CREW_JOB_DIRECTOR if job.lower() in ["director", "creator", "producer"] else CREW_JOB_OTHER
-                    )
-
-                    weight = base_freq * FEATURE_WEIGHT_CREATOR * job_weight
-                    profile.director_scores[crew_id] = profile.director_scores.get(crew_id, 0.0) + weight
-                    frequencies["directors"][crew_id] += 1
-
-        # Cast (with position weights - already calculated in vectorizer)
         for cast_item in features.get("cast", []):
             if isinstance(cast_item, dict):
                 cast_id = cast_item.get("id")
@@ -256,11 +245,8 @@ class ProfileBuilder:
                 position_weight = 1.0
 
             if cast_id:
-                # Frequency mapping: use constant base weight instead of evidence_weight
-                # Boost by small fraction if loved/liked
-                base_freq = 1.10 if is_loved else 1.0
-
-                weight = base_freq * FEATURE_WEIGHT_CREATOR * position_weight
+                # Use evidence weight multiplied by position weight
+                weight = evidence_weight * FEATURE_WEIGHT_CREATOR * position_weight
                 profile.cast_scores[cast_id] = profile.cast_scores.get(cast_id, 0.0) + weight
                 frequencies["cast"][cast_id] += 1
 
