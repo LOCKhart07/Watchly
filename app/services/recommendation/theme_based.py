@@ -60,57 +60,93 @@ class ThemeBasedService:
         # 2. Prepare common excluded genres
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
 
-        # 3. Parallel Fetching (Intersection + Individual Anchors)
-        fetch_tasks = []
+        # 3. Extract mandatory filters (country/era from ANY role)
+        all_constraints = {**anchors, **flavors, **fallbacks}
+        mandatory_filters = {}
+        if "country" in all_constraints:
+            mandatory_filters["country"] = all_constraints["country"]
+        if "era" in all_constraints:
+            mandatory_filters["era"] = all_constraints["era"]
 
-        # Seed 1: The 'Perfect Match' (AND logic) - High Priority
-        if len(anchors) > 1:
-            combined_p = self._axes_to_params(anchors, content_type)
+        logger.info(f"Theme discovery for {theme_id}: anchors={anchors}, flavors={flavors}, fallbacks={fallbacks}")
+
+        # ====================
+        # PHASE 1: Combined Fetch (ALL constraints)
+        # ====================
+        fetch_tasks = []
+        if all_constraints:
+            combined_params = self._axes_to_params(all_constraints, content_type)
             if excluded_ids:
-                with_ids = {int(g) for g in combined_p.get("with_genres", "").split("|") if g}
+                with_ids = {int(g) for g in combined_params.get("with_genres", "").split("|") if g}
                 without = [g for g in excluded_ids if g not in with_ids]
                 if without:
-                    combined_p["without_genres"] = "|".join(str(g) for g in without)
-            fetch_tasks.append(self._fetch_discover_candidates(content_type, combined_p, pages=[1, 2, 3]))
+                    combined_params["without_genres"] = "|".join(str(g) for g in without)
+            fetch_tasks.append(self._fetch_discover_candidates(content_type, combined_params, pages=[1, 2, 3]))
 
-        perfect_match_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        perfect_match_candidates = []
-        for res in perfect_match_results:
-            if isinstance(res, list):
-                perfect_match_candidates.extend(res)
-
-        if len(perfect_match_candidates) < 2 * limit:
-            fetch_tasks = []
-            # Seeds 2+: Individual Anchors (OR logic for fullness)
-            seed_axes = list(anchors.items()) if anchors else [(None, None)]
-            for name, val in seed_axes:
-                p = self._axes_to_params({name: val} if name else {}, content_type)
-                if excluded_ids:
-                    with_ids = {int(g) for g in p.get("with_genres", "").split("|") if g}
-                    without = [g for g in excluded_ids if g not in with_ids]
-                    if without:
-                        p["without_genres"] = "|".join(str(g) for g in without)
-
-                fetch_tasks.append(self._fetch_discover_candidates(content_type, p, pages=[1, 2]))
-
-        # 4. Execute and Merge
+        # Execute Phase 1
         results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
         candidates = []
         for res in results:
+            if isinstance(res, Exception):
+                logger.debug(f"Error fetching combined: {res}")
+                continue
             if isinstance(res, list):
+                for item in res:
+                    item["_discovery_tier"] = "combined"
                 candidates.extend(res)
 
-        candidates = perfect_match_candidates + candidates
+        logger.info(f"Phase 1 (combined): {len(candidates)} candidates")
 
-        # 5. Expansion Logic if sparse
+        # ====================
+        # PHASE 2: Individual Axes (if sparse)
+        # ====================
+        if len(candidates) < limit * 2:
+            fetch_tasks = []
+
+            # For EACH axis in anchors, flavors, AND fallbacks
+            for axis_name, axis_value in all_constraints.items():
+                # Build params for this single axis
+                params = self._axes_to_params({axis_name: axis_value}, content_type)
+
+                # ALWAYS add mandatory filters (country/era) if they exist and are not the current axis
+                for filter_name, filter_value in mandatory_filters.items():
+                    if filter_name != axis_name:  # Don't duplicate
+                        filter_params = self._axes_to_params({filter_name: filter_value}, content_type)
+                        params.update(filter_params)
+
+                # Apply excluded genres
+                if excluded_ids:
+                    with_ids = {int(g) for g in params.get("with_genres", "").split("|") if g}
+                    without = [g for g in excluded_ids if g not in with_ids]
+                    if without:
+                        params["without_genres"] = "|".join(str(g) for g in without)
+
+                fetch_tasks.append(self._fetch_discover_candidates(content_type, params, pages=[1, 2]))
+
+            # Execute Phase 2
+            results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    logger.debug(f"Error fetching individual: {res}")
+                    continue
+                if isinstance(res, list):
+                    for item in res:
+                        item["_discovery_tier"] = "individual"
+                    candidates.extend(res)
+
+            logger.info(f"Phase 2 (individual): Total {len(candidates)} candidates")
+
+        # 4. Expansion Logic if still sparse
         if len(candidates) < limit and anchors:
             # Expansion strategy: Relax constraints on the primary anchor
             primary_axis = dict([next(iter(anchors.items()))])
             base_p = self._axes_to_params(primary_axis, content_type)
             expanded = await self._expand_search(content_type, base_p, anchors, flavors)
+            for item in expanded:
+                item["_discovery_tier"] = "expanded"
             candidates.extend(expanded)
 
-        # 6. Weighted Scoring
+        # 5. Weighted Scoring
         scored = []
         rotation_seed = RecommendationScoring.generate_rotation_seed()
         mtype = content_type_to_mtype(content_type)
@@ -134,9 +170,14 @@ class ThemeBasedService:
             # Combine: theme match is the primary sorter for catalog rows
             final_score = (theme_match * 0.7) + (base_score * 0.3)
 
+            # Apply tier multiplier
+            tier = item.get("_discovery_tier", "individual")
+            if tier == "combined":
+                final_score *= 2.0  # Boost combined matches to appear first
+
             scored.append((final_score, item))
 
-        # 7. Rank and Enrich
+        # 6. Rank and Enrich
         scored.sort(key=lambda x: x[0], reverse=True)
         unique_results = []
         seen = set()
@@ -213,9 +254,9 @@ class ThemeBasedService:
                     start_year = int(val)
                     end_year = start_year + 9
 
-                prefix = "first_air_date" if content_type in ("tv", "series") else "primary_release_date"
-                params[f"{prefix}.gte"] = f"{start_year}-01-01"
-                params[f"{prefix}.lte"] = f"{end_year}-12-31"
+                    prefix = "first_air_date" if content_type in ("tv", "series") else "primary_release_date"
+                    params[f"{prefix}.gte"] = f"{start_year}-01-01"
+                    params[f"{prefix}.lte"] = f"{end_year}-12-31"
             except Exception:
                 logger.error("Failed to parse era axis: {}", axes["era"])
                 pass
@@ -295,14 +336,6 @@ class ThemeBasedService:
         if "with_keywords" in params:
             new_params = params.copy()
             del new_params["with_keywords"]
-            return await self._fetch_discover_candidates(content_type, new_params, pages=[1, 2])
-
-        # 2. Widen Era: remove era constraint
-        prefix = "first_air_date" if content_type in ("tv", "series") else "primary_release_date"
-        if f"{prefix}.gte" in params:
-            new_params = params.copy()
-            del new_params[f"{prefix}.gte"]
-            del new_params[f"{prefix}.lte"]
             return await self._fetch_discover_candidates(content_type, new_params, pages=[1, 2])
 
         return []
