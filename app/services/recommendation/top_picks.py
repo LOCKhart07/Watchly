@@ -14,6 +14,7 @@ from app.services.profile.sampling import SmartSampler
 from app.services.profile.scorer import ProfileScorer
 from app.services.recommendation.filtering import RecommendationFiltering
 from app.services.recommendation.metadata import RecommendationMetadata
+from app.services.recommendation.rotation import DailyRotation
 from app.services.recommendation.scoring import RecommendationScoring
 from app.services.recommendation.utils import (
     apply_discover_filters,
@@ -139,13 +140,15 @@ class TopPicksService:
         # Final filter
         filtered = filter_watched_by_imdb(enriched, watched_imdb)
 
+        rotated = DailyRotation.rotate_items(filtered, rotation_seed)
+
         elapsed_time = time.time() - start_time
         logger.info(
-            f"Top picks complete: {len(filtered)} items returned in {elapsed_time:.2f}s "
+            f"Top picks complete: {len(rotated)} items returned in {elapsed_time:.2f}s "
             f"(target: {limit}, candidates: {len(all_candidates)}, scored: {len(scored_candidates)})"
         )
 
-        return filtered[:MAX_CATALOG_ITEMS]
+        return rotated[:MAX_CATALOG_ITEMS]
 
     async def _fetch_recommendations_from_top_items(
         self,

@@ -123,8 +123,8 @@ class AllBasedService:
         logger.info(f"Filtered {len(filtered)} candidates")
 
         # Score with profile if available
+        scored = []
         if profile:
-            scored = []
             rotation_seed = RecommendationScoring.generate_rotation_seed()  # Daily rotation for fresh recommendations
             for item in filtered:
                 try:
@@ -148,8 +148,12 @@ class AllBasedService:
             # Sort by score
             scored.sort(key=lambda x: x[0], reverse=True)
             filtered = [item for _, item in scored]
+        else:
+            # No profile - just use filtered items sorted by popularity/rating
+            logger.info("No profile available, sorting by popularity")
+            filtered = sorted(filtered, key=lambda x: x.get("popularity", 0) * x.get("vote_average", 0), reverse=True)
 
-        logger.info(f"Scored {len(scored)} candidates")
+        logger.info(f"Scored {len(scored) if scored else len(filtered)} candidates")
 
         # Enrich metadata
         enriched = await RecommendationMetadata.fetch_batch(

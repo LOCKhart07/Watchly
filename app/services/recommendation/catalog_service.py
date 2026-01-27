@@ -326,6 +326,26 @@ class CatalogService:
         settings_dict = credentials.get("settings", {})
         return UserSettings(**settings_dict) if settings_dict else get_default_settings()
 
+    async def _get_trending_fallback(self, content_type: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Get trending items for new users without profiles."""
+        from app.services.recommendation.utils import content_type_to_mtype
+
+        mtype = content_type_to_mtype(content_type)
+        tmdb_service = get_tmdb_service()
+
+        try:
+            # Fetch trending week
+            trending = await tmdb_service.get_trending(mtype, "week")
+            items = trending.get("results", [])
+
+            # Enrich metadata
+            from app.services.recommendation.metadata import RecommendationMetadata
+
+            return await RecommendationMetadata.fetch_batch(tmdb_service, items, content_type, user_settings=None)
+        except Exception as e:
+            logger.warning(f"Failed to fetch trending items: {e}")
+            return []
+
     def _initialize_services(self, language: str, user_settings: UserSettings) -> dict[str, Any]:
         tmdb_service = get_tmdb_service(language=language)
         return {
@@ -402,7 +422,8 @@ class CatalogService:
                     limit=limit,
                 )
             else:
-                recommendations = []
+                logger.info(f"No profile for creators, showing trending {content_type}")
+                recommendations = await self._get_trending_fallback(content_type, limit)
             logger.info(f"Found {len(recommendations)} recommendations from creators")
 
         # Top picks
@@ -419,7 +440,8 @@ class CatalogService:
                     limit=limit,
                 )
             else:
-                recommendations = []
+                logger.info(f"No profile for top picks, showing trending {content_type}")
+                recommendations = await self._get_trending_fallback(content_type, limit)
             logger.info(f"Found {len(recommendations)} top picks for {content_type}")
 
         # Based on what you loved
