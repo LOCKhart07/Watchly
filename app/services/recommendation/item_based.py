@@ -97,9 +97,9 @@ class ItemBasedService:
         """
         combined = {}
 
-        async def fetch_and_combine(fetch_method, source_name):
+        async def fetch_and_combine(fetch_method, source_name, pages: list[int] = [1, 2, 3]):
             results = await asyncio.gather(
-                *[fetch_method(tmdb_id, mtype, page=p) for p in [1, 2, 3]],
+                *[fetch_method(tmdb_id, mtype, page=p) for p in pages],
                 return_exceptions=True,
             )
             for res in results:
@@ -115,5 +115,12 @@ class ItemBasedService:
 
         if not combined or len(combined) < 30:
             await fetch_and_combine(self.tmdb_service.get_similar, "similar")
+
+        # apply filter and check
+        filtered = filter_items_by_settings(combined.values(), self.user_settings)
+
+        if not filtered or len(filtered) < 30:
+            # fetch more similar items if there are less than 30 items after user_settings filter
+            await fetch_and_combine(self.tmdb_service.get_similar, "similar", pages=[4, 5, 6])
 
         return list(combined.values())
