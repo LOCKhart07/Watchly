@@ -29,7 +29,6 @@ SILVER_TIER_END = 10  # Up to Rank 10
 AXIS_GENRE = "genre"
 AXIS_KEYWORD = "keyword"
 AXIS_COUNTRY = "country"
-AXIS_ERA = "era"
 AXIS_RUNTIME = "runtime"
 AXIS_CREATOR = "creator"
 
@@ -62,21 +61,6 @@ def get_country_adjective(country_code: str) -> str | None:
     """Get country adjective (e.g., 'US' -> 'American')."""
     adjectives = COUNTRY_ADJECTIVES.get(country_code, [])
     return random.choice(adjectives) if adjectives else None
-
-
-def era_to_decade(era: str) -> int | None:
-    """Convert era string to decade start year."""
-    try:
-        if era.startswith("pre-"):
-            return 1960
-        return int(era.replace("s", ""))
-    except (ValueError, AttributeError):
-        return None
-
-
-def decade_to_display(decade: int) -> str:
-    """Convert decade to display string (e.g., 1990 -> '90s')."""
-    return f"{str(decade)[2:]}s"
 
 
 def runtime_to_modifier(bucket: str) -> str | None:
@@ -131,7 +115,6 @@ def build_row_id(axes: list[RowAxis]) -> str:
             AXIS_GENRE: "g",
             AXIS_KEYWORD: "k",
             AXIS_COUNTRY: "ct",
-            AXIS_ERA: "y",
             AXIS_RUNTIME: "r",
             AXIS_CREATOR: "cr",
         }.get(axis.name, "x")
@@ -194,7 +177,6 @@ class ExtractedFeatures:
         genres: list[tuple[int, float]],
         keywords: list[tuple[int, float]],
         countries: list[tuple[str, float]],
-        eras: list[tuple[str, float]],
         runtimes: list[tuple[str, float]],
         creators: list[tuple[int, float]],
         keyword_names: dict[int, str],
@@ -203,7 +185,6 @@ class ExtractedFeatures:
         self.genres = genres
         self.keywords = keywords
         self.countries = countries
-        self.eras = eras
         self.runtimes = runtimes
         self.creators = creators
         self.keyword_names = keyword_names
@@ -258,8 +239,6 @@ class RowBuilder:
             return normalize_keyword(self.features.get_keyword_name(value) or "")
         if name == AXIS_COUNTRY:
             return get_country_adjective(value)
-        if name == AXIS_ERA:
-            return decade_to_display(value[0]) if isinstance(value, (list, tuple)) else f"{value}s"
         if name == AXIS_RUNTIME:
             return runtime_to_modifier(value)
         return str(value)
@@ -332,7 +311,6 @@ class RowGeneratorService:
         genres = profile.get_top_genres(limit=5)
         keywords = profile.get_top_keywords(limit=10)
         countries = profile.get_top_countries(limit=2)
-        eras = profile.get_top_eras(limit=2)
         runtimes = sorted(profile.runtime_bucket_scores.items(), key=lambda x: x[1], reverse=True)
         creators = profile.get_top_creators(limit=5)
 
@@ -350,7 +328,6 @@ class RowGeneratorService:
             genres=genres,
             keywords=keywords,
             countries=countries,
-            eras=eras,
             runtimes=runtimes,
             creators=creators,
             keyword_names=keyword_names,
@@ -375,7 +352,7 @@ class RowGeneratorService:
         Build 'The Core' row:
         Anchor: GENRE (Gold)
         Flavor: 1-2 KEYWORDS (Gold)
-        Fallback: ERA or RUNTIME (Gold/Silver)
+        Fallback: RUNTIME (Gold/Silver)
         """
         exclude_genres = exclude_genres or set()
         exclude_keywords = exclude_keywords or set()
@@ -394,13 +371,8 @@ class RowGeneratorService:
         for k_id, _ in keywords:
             builder.add_axis(AXIS_KEYWORD, k_id, AxisRole.FLAVOR, 0.7)
 
-        # 3. Fallback: Era or Runtime
-        if random.random() < 0.5 and features.eras:
-            era = sample_from_gold_silver(features.eras, 1)
-            decade = era_to_decade(era[0][0])
-            if decade:
-                builder.add_axis(AXIS_ERA, (decade, decade + 9), AxisRole.FALLBACK, 0.3)
-        elif features.runtimes:
+        # 3. Fallback: Runtime
+        if features.runtimes:
             runtime = random.choice(features.runtimes[:2])
             builder.add_axis(AXIS_RUNTIME, runtime[0], AxisRole.FALLBACK, 0.3)
 
@@ -418,7 +390,7 @@ class RowGeneratorService:
         """
         Build 'The Blend' row:
         Anchor: GENRE (Gold)
-        Flavor: COUNTRY or ERA or secondary GENRE (Gold/Silver)
+        Flavor: COUNTRY or secondary GENRE (Gold/Silver)
         """
         exclude_genres = exclude_genres or set()
         builder = RowBuilder(features)
@@ -430,17 +402,12 @@ class RowGeneratorService:
             return None
         builder.add_axis(AXIS_GENRE, genres[0][0], AxisRole.ANCHOR, 1.0)
 
-        # 2. Flavor: Country, Era, or Secondary Genre
-        flavor_type = random.choice([AXIS_COUNTRY, AXIS_ERA, AXIS_GENRE])
+        # 2. Flavor: Country or Secondary Genre
+        flavor_type = random.choice([AXIS_COUNTRY, AXIS_GENRE])
 
         if flavor_type == AXIS_COUNTRY and features.countries:
             country = sample_from_gold_silver(features.countries, 1)
             builder.add_axis(AXIS_COUNTRY, country[0][0], AxisRole.FLAVOR, 0.7)
-        elif flavor_type == AXIS_ERA and features.eras:
-            era = sample_from_gold_silver(features.eras, 1)
-            decade = era_to_decade(era[0][0])
-            if decade:
-                builder.add_axis(AXIS_ERA, (decade, decade + 9), AxisRole.FLAVOR, 0.7)
         elif flavor_type == AXIS_GENRE:
             other_genres = [g for g in features.genres if g[0] != genres[0][0]]
             if other_genres:
@@ -449,7 +416,7 @@ class RowGeneratorService:
 
         row = builder.build()
         if row:
-            row.explanation = "The Blend: Mixing your top genres with preferred eras or international flavor."
+            row.explanation = "The Blend: Mixing your top genres with international flavor or secondary interests."
         return row
 
     def _build_rising_star_row(
@@ -460,7 +427,7 @@ class RowGeneratorService:
     ) -> RowComponents | None:
         """
         Build 'The Rising Star' row:
-        Anchor: recent KEYWORD or ERA (Silver)
+        Anchor: recent KEYWORD (Silver)
         Flavor: GENRE (Silver)
         Fallback: COUNTRY (Gold/Silver)
         """
@@ -468,20 +435,11 @@ class RowGeneratorService:
         exclude_keywords = exclude_keywords or set()
         builder = RowBuilder(features)
 
-        # 1. Anchor: Recent Keyword or Era (Sampling from Silver to promote exploration)
-        anchor_type = random.choice([AXIS_KEYWORD, AXIS_ERA])
-
-        if anchor_type == AXIS_KEYWORD:
-            available_keywords = [k for k in features.keywords if k[0] not in exclude_keywords]
-            keywords = sample_from_silver(available_keywords, 1) if available_keywords else []
-            if keywords:
-                builder.add_axis(AXIS_KEYWORD, keywords[0][0], AxisRole.ANCHOR, 1.0)
-        elif anchor_type == AXIS_ERA:
-            eras = sample_from_silver(features.eras, 1)
-            if eras:
-                decade = era_to_decade(eras[0][0])
-                if decade:
-                    builder.add_axis(AXIS_ERA, (decade, decade + 9), AxisRole.ANCHOR, 1.0)
+        # 1. Anchor: Recent Keyword (Sampling from Silver to promote exploration)
+        available_keywords = [k for k in features.keywords if k[0] not in exclude_keywords]
+        keywords = sample_from_silver(available_keywords, 1) if available_keywords else []
+        if keywords:
+            builder.add_axis(AXIS_KEYWORD, keywords[0][0], AxisRole.ANCHOR, 1.0)
 
         # If we couldn't add an anchor, this row fails
         if not builder.components.axes:
@@ -526,19 +484,6 @@ class RowGeneratorService:
             if row:
                 row.explanation = "Signature: Favorite genre fit for your preferred watch duration."
                 signature_rows.append(row)
-
-        # 3. Recent watch era × genre
-        if features.eras and features.genres:
-            builder = RowBuilder(features)
-            era = features.eras[0][0]
-            decade = era_to_decade(era)
-            if decade:
-                builder.add_axis(AXIS_ERA, (decade, decade + 9), AxisRole.ANCHOR, 1.0)
-                builder.add_axis(AXIS_GENRE, features.genres[0][0], AxisRole.FLAVOR, 0.7)
-                row = builder.build()
-                if row:
-                    row.explanation = "Signature: Exploring your favorite genre within your most watched era."
-                    signature_rows.append(row)
 
         return signature_rows
 
