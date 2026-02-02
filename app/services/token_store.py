@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import json
 from typing import Any
@@ -249,14 +248,13 @@ class TokenStore:
         if data.get("settings") and isinstance(data["settings"], dict):
             poster_rating = data["settings"].get("poster_rating")
             if poster_rating and isinstance(poster_rating, dict) and poster_rating.get("api_key"):
-                for _ in range(2):
-                    try:
-                        if poster_rating["api_key"].startswith("gAAAAA"):
-                            poster_rating["api_key"] = self.decrypt_token(poster_rating["api_key"])
-                        break
-                    except Exception as e:
-                        logger.debug(f"First decryption attempt failed for poster_rating api_key: {e}. Retrying...")
-                        await asyncio.sleep(0.5)
+                try:
+                    if poster_rating["api_key"].startswith("gAAAAA"):
+                        poster_rating["api_key"] = self.decrypt_token(poster_rating["api_key"])
+                except Exception as e:
+                    logger.debug(
+                        f"Decryption failed for poster_rating api_key associated with {redact_token(token)}: {e}"
+                    )
 
         return data
 

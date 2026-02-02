@@ -10,7 +10,6 @@ from app.core.security import redact_token
 from app.core.settings import UserSettings
 from app.services.catalog import DynamicCatalogService
 from app.services.manifest import manifest_service
-from app.services.redis_service import redis_service
 from app.services.stremio.service import StremioBundle
 from app.services.token_store import token_store
 from app.services.translation import translation_service
@@ -20,12 +19,12 @@ from app.utils.catalog import get_config_id
 class CatalogUpdater:
     """
     Catalog updater that triggers updates on-demand when users request catalogs.
-    Uses Redis locking to prevent duplicate concurrent updates across workers.
+    Uses in-memory locking to prevent duplicate concurrent updates.
     """
 
     def __init__(self):
-        # Redis key prefix for locks
-        self._lock_prefix = "watchly:updater:lock:"
+        # In-memory lock to prevent duplicate updates for the same token
+        self._updating_tokens: set[str] = set()
 
     def _needs_update(self, credentials: dict[str, Any]) -> bool:
         """Check if catalog update is needed based on last_updated timestamp."""
@@ -72,10 +71,7 @@ class CatalogUpdater:
         """
         if not credentials:
             logger.warning(f"[{redact_token(token)}] Attempted to refresh catalogs with no credentials.")
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid or expired token. Please reconfigure the addon.",
-            )
+            raise HTTPException(status_code=401, detail="Invalid or expired token. Please reconfigure the addon.")
 
         auth_key = credentials.get("authKey")
         # check if auth key is valid
@@ -169,14 +165,11 @@ class CatalogUpdater:
         """
         Trigger a catalog update if needed.
         This function checks if update is needed and fires a background task.
-        Uses Redis lock to prevent duplicate updates.
+        Uses in-memory lock to prevent duplicate updates.
         """
-        lock_key = f"{self._lock_prefix}{token}"
-
-        # Check if already updating (Distributed Lock)
-        # Using Redis SETNX with 5 minute TTL (failsafe)
-        if await redis_service.exists(lock_key):
-            logger.debug(f"[{redact_token(token)}] Update already in progress (locked), skipping")
+        # Check if already updating
+        if token in self._updating_tokens:
+            logger.debug(f"[{redact_token(token)}] Update already in progress, skipping")
             return
 
         # Check if update is needed
@@ -184,17 +177,14 @@ class CatalogUpdater:
             logger.debug(f"[{redact_token(token)}] Catalog update not needed yet")
             return
 
-        # Acquire lock
-        if not await redis_service.set_nx(lock_key, "locked", ttl=300):
-            logger.debug(f"[{redact_token(token)}] Failed to acquire lock, skipping")
-            return
-
+        # Add to lock and fire background update
+        self._updating_tokens.add(token)
         logger.info(f"[{redact_token(token)}] Triggering catalog update")
 
         # Fire and forget background task
-        asyncio.create_task(self._update_task(token, credentials, lock_key))
+        asyncio.create_task(self._update_task(token, credentials))
 
-    async def _update_task(self, token: str, credentials: dict[str, Any], lock_key: str) -> None:
+    async def _update_task(self, token: str, credentials: dict[str, Any]) -> None:
         """Background task that performs the actual catalog update."""
         try:
             success = await self.refresh_catalogs_for_credentials(token, credentials, update_timestamp=True)
@@ -205,8 +195,8 @@ class CatalogUpdater:
         except Exception as e:
             logger.exception(f"[{redact_token(token)}] Catalog update task failed: {e}")
         finally:
-            # Release lock
-            await redis_service.delete(lock_key)
+            # Always remove from lock
+            self._updating_tokens.discard(token)
 
 
 logger.info(f"Catalog updater initialized with refresh interval of {settings.CATALOG_REFRESH_INTERVAL_SECONDS} seconds")
