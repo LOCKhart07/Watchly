@@ -6,21 +6,23 @@ from typing import Any
 
 from loguru import logger
 
+from app.core.constants import DEFAULT_CATALOG_LIMIT, MAX_CATALOG_ITEMS
 from app.core.settings import UserSettings
 from app.models.taste_profile import TasteProfile
-from app.services.profile.constants import (
-    TOP_PICKS_CREATOR_CAP,
-    TOP_PICKS_ERA_CAP,
-    TOP_PICKS_GENRE_CAP,
-    TOP_PICKS_MIN_RATING,
-    TOP_PICKS_MIN_VOTE_COUNT,
-)
+from app.services.profile.constants import TOP_PICKS_CREATOR_CAP, TOP_PICKS_GENRE_CAP
 from app.services.profile.sampling import SmartSampler
 from app.services.profile.scorer import ProfileScorer
 from app.services.recommendation.filtering import RecommendationFiltering
 from app.services.recommendation.metadata import RecommendationMetadata
+from app.services.recommendation.rotation import DailyRotation
 from app.services.recommendation.scoring import RecommendationScoring
-from app.services.recommendation.utils import content_type_to_mtype, filter_watched_by_imdb, resolve_tmdb_id
+from app.services.recommendation.utils import (
+    apply_discover_filters,
+    content_type_to_mtype,
+    filter_items_by_settings,
+    filter_watched_by_imdb,
+    resolve_tmdb_id,
+)
 from app.services.scoring import ScoringService
 from app.services.tmdb.service import TMDBService
 
@@ -44,7 +46,7 @@ class TopPicksService:
         library_items: dict[str, list[dict[str, Any]]],
         watched_tmdb: set[int],
         watched_imdb: set[str],
-        limit: int = 20,
+        limit: int = DEFAULT_CATALOG_LIMIT,
     ) -> list[dict[str, Any]]:
         """
         Get top picks with diversity caps.
@@ -94,8 +96,14 @@ class TopPicksService:
         # Filter out watched items
         filtered_candidates = [item for item in all_candidates.values() if item.get("id") not in watched_tmdb]
 
+        # filter by user settings
+        filtered_candidates = filter_items_by_settings(filtered_candidates, self.user_settings)
+
+        logger.info(f"Found {len(filtered_candidates)} candidates after filtering out watched items and user settings")
+
         #  Score all candidates with profile
         scored_candidates = []
+        rotation_seed = RecommendationScoring.generate_rotation_seed()  # Daily rotation for fresh recommendations
         for item in filtered_candidates:
             try:
                 final_score = RecommendationScoring.calculate_final_score(
@@ -103,6 +111,7 @@ class TopPicksService:
                     profile=profile,
                     scorer=self.scorer,
                     mtype=mtype,
+                    rotation_seed=rotation_seed,
                 )
                 scored_candidates.append((final_score, item))
             except Exception as e:
@@ -128,23 +137,24 @@ class TopPicksService:
         )
         logger.info(f"Enriched {len(enriched)} items with full metadata")
 
-        # # Apply creator cap (after enrichment, we have full metadata)
-        # final = self._apply_creator_cap(enriched, len(enriched))
-        # logger.info(f"After creator cap: {len(final)} items")
-
-        # Final filter (remove watched by IMDB ID)
+        # Final filter
         filtered = filter_watched_by_imdb(enriched, watched_imdb)
+
+        rotated = DailyRotation.rotate_items(filtered, rotation_seed)
 
         elapsed_time = time.time() - start_time
         logger.info(
-            f"✓ Top picks complete: {len(filtered)} items returned in {elapsed_time:.2f}s "
+            f"Top picks complete: {len(rotated)} items returned in {elapsed_time:.2f}s "
             f"(target: {limit}, candidates: {len(all_candidates)}, scored: {len(scored_candidates)})"
         )
 
-        return filtered
+        return rotated[:MAX_CATALOG_ITEMS]
 
     async def _fetch_recommendations_from_top_items(
-        self, library_items: dict[str, list[dict[str, Any]]], content_type: str, mtype: str
+        self,
+        library_items: dict[str, list[dict[str, Any]]],
+        content_type: str,
+        mtype: str,
     ) -> list[dict[str, Any]]:
         """
         Fetch recommendations from top items (loved/watched/liked/added).
@@ -179,7 +189,7 @@ class TopPicksService:
             # tasks.append(self.tmdb_service.get_similar(tmdb_id, mtype, page=1))
 
         # Execute all in parallel
-        logger.debug(f"Fetching recommendations from {len(tasks)} top library items")
+        logger.info(f"Fetching recommendations from {len(tasks)} top library items")
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         failed_count = 0
@@ -200,14 +210,17 @@ class TopPicksService:
         """
         Add a discover task to the list of tasks with default parameters.
         """
+        sort_by = RecommendationFiltering.get_sort_by_preference(self.user_settings)
         params = {
-            "sort_by": "popularity.asc",
-            "vote_count_gte": TOP_PICKS_MIN_VOTE_COUNT,
-            "vote_average_gte": TOP_PICKS_MIN_RATING,
+            "sort_by": sort_by,
             **kwargs,
         }
         if without_genres:
             params["without_genres"] = without_genres
+
+        # Apply global user filters (year range, popularity)
+        params = apply_discover_filters(params, self.user_settings)
+
         tasks.append(self.tmdb_service.get_discover(mtype, **params))
 
     async def _fetch_discover_with_profile(
@@ -245,7 +258,11 @@ class TopPicksService:
         if top_genres:
             genre_ids = [g[0] for g in top_genres]
             self._add_discover_task(
-                tasks, mtype, without_genres, with_genres="|".join(str(g) for g in genre_ids), page=1
+                tasks,
+                mtype,
+                without_genres,
+                with_genres="|".join(str(g) for g in genre_ids),
+                page=1,
             )
 
         # Discover with keywords
@@ -253,20 +270,34 @@ class TopPicksService:
             keyword_ids = [k[0] for k in top_keywords]
             for page in range(1, 3):  # 2 pages
                 self._add_discover_task(
-                    tasks, mtype, without_genres, with_keywords="|".join(str(k) for k in keyword_ids), page=page
+                    tasks,
+                    mtype,
+                    without_genres,
+                    with_keywords="|".join(str(k) for k in keyword_ids),
+                    page=page,
                 )
 
         # Discover with directors
         if top_directors:
             director_ids = [d[0] for d in top_directors]
             self._add_discover_task(
-                tasks, mtype, without_genres, with_crew="|".join(str(d) for d in director_ids), page=1
+                tasks,
+                mtype,
+                without_genres,
+                with_crew="|".join(str(d) for d in director_ids),
+                page=1,
             )
 
         # Discover with cast
         if top_cast:
             cast_ids = [c[0] for c in top_cast]
-            self._add_discover_task(tasks, mtype, without_genres, with_cast="|".join(str(c) for c in cast_ids), page=1)
+            self._add_discover_task(
+                tasks,
+                mtype,
+                without_genres,
+                with_cast="|".join(str(c) for c in cast_ids),
+                page=1,
+            )
 
         # Discover with era (year range)
         if top_eras:
@@ -274,7 +305,9 @@ class TopPicksService:
             year_start = self._era_to_year_start(era)
             if year_start:
                 prefix = "first_air_date" if mtype == "tv" else "primary_release_date"
-                lte_prefix = date.today().isoformat() if year_start + 9 > date.today().year else f"{year_start+9}-12-31"
+                lte_prefix = (
+                    date.today().isoformat() if year_start + 9 > date.today().year else f"{year_start + 9}-12-31"
+                )
                 params = {
                     f"{prefix}.gte": f"{year_start}-01-01",
                     f"{prefix}.lte": lte_prefix,
@@ -333,7 +366,10 @@ class TopPicksService:
         return candidates
 
     def _apply_diversity_caps(
-        self, scored_candidates: list[tuple[float, dict[str, Any]]], limit: int, mtype: str
+        self,
+        scored_candidates: list[tuple[float, dict[str, Any]]],
+        limit: int,
+        mtype: str,
     ) -> list[dict[str, Any]]:
         """
         Apply diversity caps to ensure balanced results.
@@ -353,10 +389,10 @@ class TopPicksService:
         """
         result = []
         genre_counts = defaultdict(int)
-        era_counts = defaultdict(int)
+        # era_counts = defaultdict(int)
 
         max_per_genre = int(limit * TOP_PICKS_GENRE_CAP)
-        max_per_era = int(limit * TOP_PICKS_ERA_CAP)
+        # max_per_era = int(limit * TOP_PICKS_ERA_CAP)
 
         for score, item in scored_candidates:
             if len(result) >= limit:
@@ -369,35 +405,31 @@ class TopPicksService:
             # Quality threshold
             vote_count = item.get("vote_count", 0)
             vote_avg = item.get("vote_average", 0)
-            if vote_count < TOP_PICKS_MIN_VOTE_COUNT:
+
+            # Dynamic check
+            min_rating, min_votes = RecommendationFiltering.get_quality_thresholds(self.user_settings)
+
+            if vote_count < min_votes:
                 continue
 
+            # We keep weighted rating check but use dynamic base
             wr = RecommendationScoring.weighted_rating(vote_avg, vote_count, C=7.2 if mtype == "tv" else 6.8)
-            if wr < TOP_PICKS_MIN_RATING:
+            if wr < min_rating:
                 continue
 
             # Check genre cap (50% max per genre)
             genre_ids = item.get("genre_ids", [])
-            if genre_ids:
-                top_genre = genre_ids[0]  # Primary genre
-                if genre_counts[top_genre] >= max_per_genre:
-                    continue
+            top_genre = genre_ids[0] if genre_ids else None
 
-            # Check era cap (50% max per era)
-            year = self._extract_year(item)
-            if year:
-                era = self._year_to_era(year)
-                if era_counts[era] >= max_per_era:
+            if top_genre:
+                if genre_counts[top_genre] >= max_per_genre:
                     continue
 
             # Add item
             result.append(item)
 
-            if genre_ids:
+            if top_genre:
                 genre_counts[top_genre] += 1
-            if year:
-                era = self._year_to_era(year)
-                era_counts[era] += 1
 
         return result
 
@@ -467,7 +499,7 @@ class TopPicksService:
 
     @staticmethod
     def _is_recent_release(item: dict[str, Any], threshold: datetime, mtype: str) -> bool:
-        """Check if item was released within the threshold (e.g., last 6 months)."""
+        """Check if item was released within the threshold (e.g., last 3 months)."""
         release_date_str = item.get("release_date") if mtype == "movie" else item.get("first_air_date")
         if not release_date_str:
             return False

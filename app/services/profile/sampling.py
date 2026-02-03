@@ -53,32 +53,75 @@ class SmartSampler:
         if not typed_items:
             return []
 
-        # Get added items (strong signal)
+        if len(typed_items) <= max_items:
+            # score all typed items and return
+            return [self.scoring_service.process_item(it) for it in typed_items]
+
+        # De-duplicate by ID
+        unique_items = {}
+        for it in typed_items:
+            item_id = it.get("_id")
+            if item_id:
+                unique_items[item_id] = it
+
+        # If still within limit after de-duplication
+        if len(unique_items) <= max_items:
+            return [self.scoring_service.process_item(it) for it in unique_items.values()]
+
+        # Get set of added item IDs for classification
         added_item_ids = {it.get("_id") for it in library_items.get("added", [])}
-        added_items = [it for it in typed_items if it.get("_id") in added_item_ids]
 
-        # Separate loved/liked from watched items (excluding added to avoid double-counting)
-        loved_liked_items = [
-            it
-            for it in typed_items
-            if (it.get("_is_loved") or it.get("_is_liked")) and it.get("_id") not in added_item_ids
-        ]
-        watched_items = [
-            it
-            for it in typed_items
-            if not (it.get("_is_loved") or it.get("_is_liked") or it.get("_id") in added_item_ids)
-        ]
+        # Separate items into pools and score them
+        loved_liked_pool = []
+        added_pool = []
+        watched_pool = []
 
-        # Always include strong signal items: Loved/Liked: 40%, Added: 20%
-        strong_signal_items = loved_liked_items[: int(max_items * 0.40)] + added_items[: int(max_items * 0.20)]
-        strong_signal_scored = [self.scoring_service.process_item(it) for it in strong_signal_items]
+        for it in unique_items.values():
+            scored = self.scoring_service.process_item(it)
+            if scored.source_type in ["loved", "liked"]:
+                loved_liked_pool.append(scored)
+            elif it.get("_id") in added_item_ids:
+                added_pool.append(scored)
+            else:
+                watched_pool.append(scored)
 
-        # Score watched items and sort by score
-        watched_scored = [self.scoring_service.process_item(it) for it in watched_items]
-        watched_scored.sort(key=lambda x: x.score, reverse=True)
+        # Sort pools by score to ensure we take the most relevant items first
+        # If we sort this, we will get high scoring items, but if we don't sort this,
+        # we will get recent items. Maybe recent is good? I think yeah. Lets do that...
+        # it will likely by almost similar but not confirmed.
+        # loved_liked_pool.sort(key=lambda x: x.score, reverse=True)
+        # added_pool.sort(key=lambda x: x.score, reverse=True)
+        # watched_pool.sort(key=lambda x: x.score, reverse=True)
 
-        # Fill remaining slots with top watched items
-        remaining_slots = max(0, max_items - len(strong_signal_scored))
-        top_watched = watched_scored[:remaining_slots]
+        # Step 1: Fill quotas
+        final_scored_items: list[ScoredItem] = []
+        used_ids: set[str] = set()
 
-        return strong_signal_scored + top_watched
+        loved_quota = int(max_items * 0.40)
+        added_quota = int(max_items * 0.20)
+        watched_quota = max_items - loved_quota - added_quota
+
+        # Add initial quotas
+        for pool, quota in [
+            (loved_liked_pool, loved_quota),
+            (added_pool, added_quota),
+            (watched_pool, watched_quota),
+        ]:
+            for scored in pool[:quota]:
+                final_scored_items.append(scored)
+                used_ids.add(scored.item.id)
+
+        # Step 2: Backfill if we have remaining slots
+        remaining_slots = max_items - len(final_scored_items)
+        if remaining_slots > 0:
+            # Priority for backfill: Loved > Added > Watched
+            for pool in [loved_liked_pool, added_pool, watched_pool]:
+                for scored in pool:
+                    if remaining_slots <= 0:
+                        break
+                    if scored.item.id not in used_ids:
+                        final_scored_items.append(scored)
+                        used_ids.add(scored.item.id)
+                        remaining_slots -= 1
+
+        return final_scored_items

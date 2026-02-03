@@ -2,6 +2,7 @@ from typing import Any
 
 from loguru import logger
 
+from app.core.constants import DISCOVERY_SETTINGS
 from app.services.recommendation.filtering import RecommendationFiltering
 from app.services.recommendation.metadata import RecommendationMetadata
 
@@ -144,6 +145,9 @@ async def pad_to_min(
         logger.debug(f"Error fetching trending/top-rated for padding: {e}")
         return existing
 
+    # Filter pool by user settings (years, popularity)
+    pool = filter_items_by_settings(pool, user_settings)
+
     # Get existing TMDB IDs
     existing_tmdb = set()
     for it in existing:
@@ -207,3 +211,110 @@ async def pad_to_min(
             break
 
     return existing + extra
+
+
+def build_discover_params(user_settings: Any) -> dict[str, Any]:
+    """
+    Build TMDB discover API parameters based on user settings.
+    """
+    params = {}
+    if not user_settings:
+        return params
+
+    from datetime import datetime
+
+    current_date = datetime.now()
+    current_year = current_date.year
+
+    # 1. Year Range
+    year_min = getattr(user_settings, "year_min", 1970)
+    year_max = getattr(user_settings, "year_max", current_year)
+
+    # Apply to both movie and tv date fields for convenience in merging
+    for prefix in ["primary_release_date", "first_air_date"]:
+        params[f"{prefix}.gte"] = f"{year_min}-01-01"
+
+        # If year_max is current year or greater, use today's date for 'lte'
+        # relative to the current time.
+        if year_max >= current_year:
+            params[f"{prefix}.lte"] = current_date.strftime("%Y-%m-%d")
+        else:
+            params[f"{prefix}.lte"] = f"{year_max}-12-31"
+
+    return params
+
+
+def apply_discover_filters(params: dict[str, Any], user_settings: Any) -> dict[str, Any]:
+    """
+    Merge specific discover params with global user settings (years, popularity).
+    """
+    if not user_settings:
+        return params
+
+    global_params = build_discover_params(user_settings)
+
+    params = {**global_params, **params}
+
+    min_rating, min_votes = RecommendationFiltering.get_quality_thresholds(user_settings)
+
+    # Apply dynamic thresholds if not overridden by stricter local params
+    if "vote_count.gte" not in params:
+        params["vote_count.gte"] = min_votes
+
+    if "vote_average.gte" not in params:
+        params["vote_average.gte"] = min_rating
+
+    return params
+
+
+def filter_items_by_settings(items: list[dict[str, Any]], user_settings: Any) -> list[dict[str, Any]]:
+    """
+    Filter items post-fetch based on global user settings (years, popularity).
+    Used for items from recommendations/similar APIs that don't support early filtering.
+    """
+    if not user_settings:
+        return items
+
+    year_min = getattr(user_settings, "year_min", 1970)
+    year_max = getattr(user_settings, "year_max", 2026)
+    pop_pref = getattr(user_settings, "popularity", "balanced")
+
+    filtered = []
+
+    for item in items:
+        # 1. Year Filtering
+        release_date = item.get("release_date") or item.get("first_air_date")
+        if release_date:
+            try:
+                year = int(release_date.split("-")[0])
+                if year < year_min or year > year_max:
+                    continue
+            except (ValueError, IndexError):
+                pass
+
+        params = DISCOVERY_SETTINGS.get(pop_pref, {})
+        if not params:
+            continue
+
+        # determine operations
+        ops = {
+            "gte": lambda x, y: x >= y,
+            "lte": lambda x, y: x <= y,
+        }
+
+        passes_all_checks = True
+        for param in params:
+            t_param, param_ops = param.split(".")
+            param_operator = ops.get(param_ops)
+            if not param_operator:
+                continue
+
+            item_value = item.get(t_param)
+            if item_value is None or not param_operator(item_value, params[param]):
+                passes_all_checks = False
+                break
+
+        if passes_all_checks:
+            filtered.append(item)
+
+    return filtered

@@ -4,7 +4,6 @@ from collections.abc import Callable
 from typing import Any
 
 from app.core.constants import DEFAULT_MINIMUM_RATING_FOR_THEME_BASED_MOVIE, DEFAULT_MINIMUM_RATING_FOR_THEME_BASED_TV
-from app.services.profile.constants import MAXIMUM_POPULARITY_SCORE, TOP_PICKS_MIN_RATING, TOP_PICKS_MIN_VOTE_COUNT
 
 
 class RecommendationScoring:
@@ -37,6 +36,25 @@ class RecommendationScoring:
         h = hashlib.md5(f"{seed}:{tmdb_id}".encode()).hexdigest()
         eps = int(h[-6:], 16) % 1000
         return eps / 1_000_000.0
+
+    @staticmethod
+    def generate_rotation_seed(token: str | None = None) -> str:
+        """
+        Generate a daily rotation seed for deterministic but fresh recommendations.
+
+        Args:
+            token: Optional user token for per-user variation.
+                   If None, uses a global seed (same for all users on same day).
+
+        Returns:
+            A seed string like "abc123:2026-01-15"
+        """
+        from datetime import date
+
+        today = date.today().isoformat()
+        if token:
+            return f"{token}:{today}"
+        return f"global:{today}"
 
     @staticmethod
     def get_recency_multiplier_fn(
@@ -94,16 +112,14 @@ class RecommendationScoring:
     @staticmethod
     def apply_quality_adjustments(score: float, wr: float, vote_count: int, popularity: float) -> float:
         """Apply simple quality boost for high-confidence items only."""
-        # if vote_count >= 1000 and wr >= 7.5 and popularity <= MAXIMUM_POPULARITY_SCORE:
-        #     # Proven gem: high confidence, high quality
-        #     return score * 1.10
-        if (
-            vote_count >= TOP_PICKS_MIN_VOTE_COUNT
-            and wr >= TOP_PICKS_MIN_RATING
-            and popularity <= MAXIMUM_POPULARITY_SCORE
-        ):
+
+        # If item is extremely popular, give it a small boost to ensure it surfaces
+        if popularity > 500.0 and wr > 7.5:
+            return score * 1.05
+
+        if vote_count >= 100 and wr >= 7.0 and popularity <= 100.0:
             # Good confidence and quality Strong boost
-            return score * 1.30
+            return score * 1.10
 
         return score
 
@@ -113,6 +129,7 @@ class RecommendationScoring:
         profile: Any,
         scorer: Any,
         mtype: str,
+        rotation_seed: str | None = None,
     ) -> float:  # noqa: E501
         """
         Calculate final recommendation score combining profile similarity and quality.
@@ -122,11 +139,12 @@ class RecommendationScoring:
             profile: User taste profile
             scorer: ProfileScorer instance
             mtype: Media type (movie/tv) to determine minimum rating
-            minimum_rating_tv: Minimum rating constant for TV
-            minimum_rating_movie: Minimum rating constant for movies
+            rotation_seed: Optional seed for daily rotation (e.g., "token:2026-01-15").
+                          When provided, adds a tiny epsilon for deterministic tie-breaking
+                          that changes daily, making recommendations feel fresh.
 
         Returns:
-            Final combined score (0-1 range)
+            Final combined score (0-1 range, with optional epsilon for rotation)
         """
         # Score with profile
         profile_score = scorer.score_item(item, profile)
@@ -151,5 +169,10 @@ class RecommendationScoring:
         vote_count = item.get("vote_count", 0)
         popularity = item.get("popularity", 0)
         final_score = RecommendationScoring.apply_quality_adjustments(base_score, wr, vote_count, popularity)
+        # Apply daily rotation epsilon for tie-breaking (if seed provided)
+        if rotation_seed:
+            tmdb_id = item.get("id", 0)
+            epsilon = RecommendationScoring.stable_epsilon(tmdb_id, rotation_seed)
+            final_score += epsilon
 
         return final_score

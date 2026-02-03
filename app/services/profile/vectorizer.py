@@ -1,7 +1,16 @@
 from typing import Any
 
 from app.models.scoring import ScoredItem
-from app.services.profile.constants import CAST_POSITION_LEAD, CAST_POSITION_MINOR, CAST_POSITION_SUPPORTING
+from app.services.cinemeta_service import CinemetaService, cinemeta_service
+from app.services.profile.constants import (
+    CAST_POSITION_LEAD,
+    CAST_POSITION_MINOR,
+    RUNTIME_BUCKET_MEDIUM_MAX_MOVIE,
+    RUNTIME_BUCKET_MEDIUM_MAX_SERIES,
+    RUNTIME_BUCKET_SHORT_MAX_MOVIE,
+    RUNTIME_BUCKET_SHORT_MAX_SERIES,
+)
+from app.services.tmdb.service import TMDBService
 
 
 class ProfileVectorizer:
@@ -28,7 +37,15 @@ class ProfileVectorizer:
         genres = [g.get("id") for g in metadata.get("genres", []) if g.get("id")]
 
         # Extract keywords
-        keywords = [k.get("id") for k in metadata.get("keywords", {}).get("keywords", []) if k.get("id")]
+        keywords_dict = metadata.get("keywords")
+        if isinstance(keywords_dict, dict):
+            keywords = keywords_dict.get("results", [])  # for series
+            if not keywords:
+                keywords = keywords_dict.get("keywords", [])  # for movies
+        else:
+            keywords = keywords_dict
+
+        keywords = [k.get("id") for k in keywords if k.get("id")]
 
         # Extract cast (top 10)
         cast = []
@@ -79,7 +96,8 @@ class ItemVectorizer:
         Args:
             tmdb_service: TMDB service for fetching metadata
         """
-        self.tmdb_service = tmdb_service
+        self.tmdb_service: TMDBService = tmdb_service
+        self.cinemeta_service: CinemetaService = cinemeta_service
 
     async def extract_features(self, item: ScoredItem) -> dict[str, Any] | None:
         """
@@ -111,8 +129,8 @@ class ItemVectorizer:
             if not vector:
                 return None
 
-            # Transform to our format (pass metadata for crew job extraction)
-            return self._transform_vector(vector, metadata)
+            # Transform to our format (pass metadata and item type for extraction)
+            return await self._transform_vector(vector, metadata, item.item.type)
 
         except Exception as e:
             from loguru import logger
@@ -120,13 +138,16 @@ class ItemVectorizer:
             logger.exception(f"Failed to extract features from item {item.item.id}: {e}")
             return None
 
-    def _transform_vector(self, vector: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    async def _transform_vector(
+        self, vector: dict[str, Any], metadata: dict[str, Any], content_type: str
+    ) -> dict[str, Any]:
         """
         Transform legacy vector format to our feature format.
 
         Args:
             vector: Legacy vector format
             metadata: Full metadata for additional extraction
+            content_type: Content type (movie or series)
 
         Returns:
             Transformed feature dictionary
@@ -143,6 +164,20 @@ class ItemVectorizer:
         # Extract era bucket from year
         if features["year"]:
             features["era"] = self._year_to_era(features["year"])
+
+        imdb_id = metadata.get("external_ids", {}).get("imdb_id")
+        cinemeta_metadata = await self.cinemeta_service.get_metadata(imdb_id, content_type)
+
+        # Extract runtime bucket
+        runtime_bucket = await self._extract_runtime_bucket(cinemeta_metadata)
+        if runtime_bucket:
+            features["runtime_bucket"] = runtime_bucket
+
+        # Extract number of episodes (for series only)
+        if content_type == "series":
+            num_episodes = self._extract_episode_count(cinemeta_metadata)
+            if num_episodes:
+                features["episode_count"] = num_episodes
 
         return features
 
@@ -186,12 +221,11 @@ class ItemVectorizer:
         Returns:
             Position weight
         """
-        if position == 0:
-            return CAST_POSITION_LEAD
-        elif position < 3:
-            return CAST_POSITION_SUPPORTING
-        else:
-            return CAST_POSITION_MINOR
+        # Use a decremental (not step-wise) formula for cast position weight, e.g., exponential decay
+        # Lead (position 0) is 1.0, next: base**position, with minimum clamp at CAST_POSITION_MINOR.
+        BASE = 0.7  # Chosen for smooth, decremental decay
+        weight = CAST_POSITION_LEAD * (BASE**position)
+        return max(weight, CAST_POSITION_MINOR)
 
     def _extract_crew_with_jobs(self, metadata: dict[str, Any]) -> list[dict[str, Any]]:
         """
@@ -204,6 +238,15 @@ class ItemVectorizer:
             List of crew dicts with id and job
         """
         crew_list = []
+        # check if it has created_by
+        created_by = metadata.get("created_by", []) or []
+        if created_by:
+            for creator in created_by:
+                if isinstance(creator, dict):
+                    creator_id = creator.get("id")
+                    if creator_id:
+                        crew_list.append({"id": creator_id, "job": "Creator"})
+
         credits = metadata.get("credits", {}) or {}
         crew = credits.get("crew", []) or []
 
@@ -218,6 +261,57 @@ class ItemVectorizer:
                 crew_list.append({"id": crew_id, "job": job})
 
         return crew_list
+
+    async def _extract_runtime_bucket(self, cinemeta_metadata: dict[str, Any]) -> str | None:
+        """
+        Extract runtime and convert to bucket.
+
+        Args:
+            metadata: Full metadata dict
+
+        Returns:
+            Runtime bucket string (short/medium/long) or None
+        """
+
+        # fetch metadata from cinemeta for runtime.
+        runtime = 0
+        content_type = cinemeta_metadata.get("type")
+
+        runtime_str = cinemeta_metadata.get("runtime", "0 min")
+        if runtime_str:
+            runtime = int(runtime_str.split(" ")[0])
+
+        if not runtime or not isinstance(runtime, (int, float)):
+            return None
+
+        short_runtime_max = (
+            RUNTIME_BUCKET_SHORT_MAX_MOVIE if content_type == "movie" else RUNTIME_BUCKET_SHORT_MAX_SERIES
+        )
+        medium_runtime_max = (
+            RUNTIME_BUCKET_MEDIUM_MAX_MOVIE if content_type == "movie" else RUNTIME_BUCKET_MEDIUM_MAX_SERIES
+        )
+
+        if runtime < short_runtime_max:
+            return "short"
+        elif runtime < medium_runtime_max:
+            return "medium"
+        else:
+            return "long"
+
+    @staticmethod
+    def _extract_episode_count(cinemeta_metadata: dict[str, Any]) -> int | None:
+        """
+        Extract number of episodes for series.
+
+        Args:
+            metadata: Full metadata dict
+
+        Returns:
+            Number of episodes or None
+        """
+        episodes = [v for v in cinemeta_metadata.get("videos", []) if v.get("season") != 0]  # remove specials
+        num_episodes = len(episodes)
+        return num_episodes
 
     @staticmethod
     def _year_to_era(year: int) -> str:

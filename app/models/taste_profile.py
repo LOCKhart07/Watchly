@@ -23,10 +23,21 @@ class TasteProfile(BaseModel):
     country_scores: dict[str, float] = Field(default_factory=dict, description="Country code → accumulated score")
     director_scores: dict[int, float] = Field(default_factory=dict, description="Director ID → accumulated score")
     cast_scores: dict[int, float] = Field(default_factory=dict, description="Actor ID → accumulated score")
+    runtime_bucket_scores: dict[str, float] = Field(
+        default_factory=dict,
+        description="Runtime bucket (short/medium/long) → accumulated score",
+    )
 
     # Metadata
+    average_episodes: float | None = Field(
+        default=None, description="Weighted average episodes per series (series only)"
+    )
     last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     content_type: str | None = Field(default=None, description="movie or series")
+    processed_items: set[str] = Field(
+        default_factory=set,
+        description="Set of processed item IDs to prevent double counting",
+    )
 
     class Config:
         """Pydantic configuration."""
@@ -91,4 +102,5 @@ class TasteProfile(BaseModel):
             "directors": normalize_dict(self.director_scores),
             "cast": normalize_dict(self.cast_scores),
             "creators": normalize_dict({**self.director_scores, **self.cast_scores}),
+            "runtime_buckets": normalize_dict(self.runtime_bucket_scores),
         }

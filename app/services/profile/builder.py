@@ -14,18 +14,20 @@ from app.services.profile.constants import (
     CAP_ERA,
     CAP_GENRE,
     CAP_KEYWORD,
-    CREW_JOB_DIRECTOR,
-    CREW_JOB_OTHER,
+    CAP_RUNTIME,
     FEATURE_WEIGHT_COUNTRY,
     FEATURE_WEIGHT_CREATOR,
     FEATURE_WEIGHT_ERA,
     FEATURE_WEIGHT_GENRE,
     FEATURE_WEIGHT_KEYWORD,
+    FEATURE_WEIGHT_RUNTIME,
     FREQUENCY_ENABLED,
     FREQUENCY_MULTIPLIER_BASE,
     FREQUENCY_MULTIPLIER_LOG_FACTOR,
     GENRE_MAX_POSITIONS,
     GENRE_POSITION_WEIGHTS,
+    PROFILE_DECAY_ENABLED,
+    PROFILE_DECAY_FACTOR,
 )
 from app.services.profile.evidence import EvidenceCalculator
 from app.services.profile.vectorizer import ItemVectorizer
@@ -34,12 +36,6 @@ from app.services.profile.vectorizer import ItemVectorizer
 class ProfileBuilder:
     """
     Builds taste profile using additive accumulation.
-
-    Design principles:
-    - Pure accumulation: score += weight (no conditionals)
-    - Same weight to all metadata of an item
-    - No normalization at write time
-    - Easy to debug: print(profile.genre_scores)
     """
 
     def __init__(self, vectorizer: ItemVectorizer):
@@ -74,14 +70,22 @@ class ProfileBuilder:
             "countries": defaultdict(int),
             "directors": defaultdict(int),
             "cast": defaultdict(int),
+            "runtime_buckets": defaultdict(int),
         }
+
+        # Track weighted average for episodes (series only)
+        total_weighted_episodes = 0.0
+        total_weight_for_episodes = 0.0
+
+        # Track processed items
+        processed_ids = set()
 
         # Process all items in parallel
         tasks = [self._process_item(item, content_type) for item in scored_items]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # First pass: accumulate scores and track frequencies
-        for result in results:
+        for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.debug(f"Failed to process item: {result}")
                 continue
@@ -89,10 +93,30 @@ class ProfileBuilder:
             if not result:
                 continue
 
-            features, evidence_weight = result
+            # Add to processed IDs
+            processed_ids.add(scored_items[i].item.id)
+
+            # Try to unpack as 3-tuple first (new format)
+            try:
+                features, evidence_weight, is_loved = result  # type: ignore
+            except (ValueError, TypeError):
+                # Try to unpack as 2-tuple (old format)
+                try:
+                    features, evidence_weight = result  # type: ignore
+                    is_loved = False
+                except (ValueError, TypeError):
+                    logger.debug(f"Failed to unpack result: {result}")
+                    continue
 
             # Accumulate scores (pure addition)
-            self._accumulate_features(profile, features, evidence_weight, feature_frequencies)
+            self._accumulate_features(profile, features, evidence_weight, is_loved, feature_frequencies)
+
+            # Track weighted episodes for average calculation (series only)
+            if profile.content_type == "series" or profile.content_type is None:
+                episode_count = features.get("episode_count")
+                if episode_count and isinstance(episode_count, (int, float)):
+                    total_weighted_episodes += float(episode_count) * evidence_weight
+                    total_weight_for_episodes += evidence_weight
 
         # Second pass: apply frequency multipliers if enabled
         if FREQUENCY_ENABLED:
@@ -101,9 +125,21 @@ class ProfileBuilder:
         # Apply caps
         self._apply_caps(profile)
 
+        # Calculate average episodes (series only)
+        if total_weight_for_episodes > 0:
+            profile.average_episodes = total_weighted_episodes / total_weight_for_episodes
+
+        profile.processed_items = processed_ids
+
+        if not profile.genre_scores and not profile.keyword_scores:
+            logger.warning(
+                f"Built profile for {content_type} but all scores are empty. Library may have processing issues."
+            )
         return profile
 
-    async def _process_item(self, item: ScoredItem, content_type: str | None) -> tuple[dict[str, Any], float] | None:
+    async def _process_item(
+        self, item: ScoredItem, content_type: str | None
+    ) -> tuple[dict[str, Any], float, bool] | None:
         """
         Process a single item and extract features.
 
@@ -112,7 +148,7 @@ class ProfileBuilder:
             content_type: Filter by content type
 
         Returns:
-            Tuple of (features_dict, evidence_weight) or None
+            Tuple of (features_dict, evidence_weight, is_loved) or None
         """
         # Filter by content type
         if content_type and item.item.type != content_type:
@@ -125,28 +161,31 @@ class ProfileBuilder:
 
         # Calculate evidence weight
         evidence_weight = self.evidence_calculator.calculate_evidence_weight(item)
+        is_loved = item.item.is_loved or item.item.is_liked
 
-        return features, evidence_weight
+        return features, evidence_weight, is_loved
 
     def _accumulate_features(
         self,
         profile: TasteProfile,
         features: dict[str, Any],
         evidence_weight: float,
-        frequencies: dict[str, dict[Any, int]],
+        is_loved: bool,
+        frequencies: dict[str, dict[Any, int]] | None = None,
     ) -> None:
         """
         Accumulate features into profile (pure addition).
 
         Same evidence_weight applied to all features of the item.
-        No conditionals, no derived features.
 
         Args:
             profile: Profile to update
             features: Extracted features
             evidence_weight: Weight for this item
+            is_loved: Whether the item is loved/liked
             frequencies: Frequency tracker for optional multipliers
         """
+
         # Genres (with position-based decay - only top 3)
         genres = features.get("genres", [])[:GENRE_MAX_POSITIONS]
         for idx, genre_id in enumerate(genres):
@@ -155,30 +194,35 @@ class ProfileBuilder:
                 position_weight = GENRE_POSITION_WEIGHTS[idx] if idx < len(GENRE_POSITION_WEIGHTS) else 0.1
                 weight = evidence_weight * FEATURE_WEIGHT_GENRE * position_weight
                 profile.genre_scores[genre_id] = profile.genre_scores.get(genre_id, 0.0) + weight
-                frequencies["genres"][genre_id] += 1
+                if frequencies is not None:
+                    frequencies["genres"][genre_id] += 1
 
         # Keywords
-        for keyword_id in features.get("keywords", []):
+        keywords = features.get("keywords", [])
+
+        for keyword_id in keywords:
             if keyword_id:
                 weight = evidence_weight * FEATURE_WEIGHT_KEYWORD
                 profile.keyword_scores[keyword_id] = profile.keyword_scores.get(keyword_id, 0.0) + weight
-                frequencies["keywords"][keyword_id] += 1
+                if frequencies is not None:
+                    frequencies["keywords"][keyword_id] += 1
 
         # Eras
         era = features.get("era")
         if era:
             weight = evidence_weight * FEATURE_WEIGHT_ERA
             profile.era_scores[era] = profile.era_scores.get(era, 0.0) + weight
-            frequencies["eras"][era] += 1
+            if frequencies is not None:
+                frequencies["eras"][era] += 1
 
         # Countries
         for country_code in features.get("countries", []):
             if country_code:
                 weight = evidence_weight * FEATURE_WEIGHT_COUNTRY
                 profile.country_scores[country_code] = profile.country_scores.get(country_code, 0.0) + weight
-                frequencies["countries"][country_code] += 1
+                if frequencies is not None:
+                    frequencies["countries"][country_code] += 1
 
-        # Directors (with job-based weights)
         crew_list = features.get("crew", [])
         if isinstance(crew_list, list):
             for crew_item in crew_list:
@@ -190,13 +234,13 @@ class ProfileBuilder:
                     job = ""
 
                 if crew_id:
-                    # Director gets full weight, others get 0.5
-                    job_weight = CREW_JOB_DIRECTOR if job == "director" else CREW_JOB_OTHER
-                    weight = evidence_weight * FEATURE_WEIGHT_CREATOR * job_weight
-                    profile.director_scores[crew_id] = profile.director_scores.get(crew_id, 0.0) + weight
-                    frequencies["directors"][crew_id] += 1
+                    # Only count actual directors (for movies) and creators (for TV series)
+                    if job in ["director", "creator"]:
+                        weight = evidence_weight * FEATURE_WEIGHT_CREATOR
+                        profile.director_scores[crew_id] = profile.director_scores.get(crew_id, 0.0) + weight
+                        if frequencies is not None:
+                            frequencies["directors"][crew_id] += 1
 
-        # Cast (with position weights - already calculated in vectorizer)
         for cast_item in features.get("cast", []):
             if isinstance(cast_item, dict):
                 cast_id = cast_item.get("id")
@@ -206,9 +250,20 @@ class ProfileBuilder:
                 position_weight = 1.0
 
             if cast_id:
+                # Use evidence weight multiplied by position weight
                 weight = evidence_weight * FEATURE_WEIGHT_CREATOR * position_weight
                 profile.cast_scores[cast_id] = profile.cast_scores.get(cast_id, 0.0) + weight
-                frequencies["cast"][cast_id] += 1
+                if frequencies is not None:
+                    frequencies["cast"][cast_id] += 1
+
+        # Runtime buckets
+        runtime_bucket = features.get("runtime_bucket")
+        if runtime_bucket:
+            weight = evidence_weight * FEATURE_WEIGHT_RUNTIME
+            current_score = profile.runtime_bucket_scores.get(runtime_bucket, 0.0)
+            profile.runtime_bucket_scores[runtime_bucket] = current_score + weight
+            if frequencies is not None:
+                frequencies["runtime_buckets"][runtime_bucket] += 1
 
     def _apply_frequency_multipliers(self, profile: TasteProfile, frequencies: dict[str, dict[Any, int]]) -> None:
         """
@@ -242,6 +297,12 @@ class ProfileBuilder:
                 multiplier = FREQUENCY_MULTIPLIER_BASE + (math.log(freq) * FREQUENCY_MULTIPLIER_LOG_FACTOR)
                 profile.cast_scores[cast_id] *= multiplier
 
+        # Runtime buckets
+        for runtime_bucket, freq in frequencies["runtime_buckets"].items():
+            if freq > 1:
+                multiplier = FREQUENCY_MULTIPLIER_BASE + (math.log(freq) * FREQUENCY_MULTIPLIER_LOG_FACTOR)
+                profile.runtime_bucket_scores[runtime_bucket] *= multiplier
+
     @staticmethod
     def _apply_caps(profile: TasteProfile) -> None:
         """
@@ -273,3 +334,89 @@ class ProfileBuilder:
         # Cap countries
         for country in profile.country_scores:
             profile.country_scores[country] = min(profile.country_scores[country], CAP_COUNTRY)
+
+        # Cap runtime buckets
+        for runtime_bucket in profile.runtime_bucket_scores:
+            current_score = profile.runtime_bucket_scores[runtime_bucket]
+            profile.runtime_bucket_scores[runtime_bucket] = min(current_score, CAP_RUNTIME)
+
+    async def update_profile_incrementally(
+        self,
+        existing_profile: TasteProfile,
+        new_items: list[ScoredItem],
+        content_type: str | None = None,
+    ) -> TasteProfile:
+        """
+        Update existing profile with new items only.
+
+        Args:
+            existing_profile: Existing TasteProfile to update
+            new_items: List of new ScoredItem to add
+            content_type: Content type filter (movie/series) or None
+
+        Returns:
+            Updated TasteProfile
+        """
+        if not existing_profile:
+            # No existing profile, build from scratch
+            return await self.build_profile(new_items, content_type)
+
+        # Apply gentle age decay if enabled
+        if PROFILE_DECAY_ENABLED:
+            self._apply_age_decay(existing_profile)
+
+        # Process new items and accumulate features
+        tasks = [self._process_item(item, content_type) for item in new_items]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.debug(f"Failed to process incremental item: {result}")
+                continue
+
+            if not result:
+                continue
+
+            # Add to processed IDs
+            existing_profile.processed_items.add(new_items[i].item.id)
+
+            # Try to unpack as 3-tuple first (new format)
+            try:
+                features, evidence_weight, is_loved = result  # type: ignore
+            except (ValueError, TypeError):
+                # Try to unpack as 2-tuple (old format)
+                try:
+                    features, evidence_weight = result  # type: ignore
+                    is_loved = False
+                except (ValueError, TypeError):
+                    logger.debug(f"Failed to unpack result: {result}")
+                    continue
+
+            self._accumulate_features(existing_profile, features, evidence_weight, is_loved)
+
+        # Apply caps to prevent unbounded growth
+        self._apply_caps(existing_profile)
+
+        return existing_profile
+
+    def _apply_age_decay(self, profile: TasteProfile) -> None:
+        """
+        Apply gentle age decay to keep profile fresh.
+
+        Args:
+            profile: Profile to apply decay to
+        """
+        # Apply configured decay to all scores
+        decay_factor = PROFILE_DECAY_FACTOR
+
+        for score_dict in [
+            profile.genre_scores,
+            profile.keyword_scores,
+            profile.director_scores,
+            profile.cast_scores,
+            profile.era_scores,
+            profile.country_scores,
+            profile.runtime_bucket_scores,
+        ]:
+            for key in score_dict:
+                score_dict[key] *= decay_factor

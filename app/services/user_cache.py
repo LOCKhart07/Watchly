@@ -1,4 +1,6 @@
+import hashlib
 import json
+import time
 from typing import Any
 
 from loguru import logger
@@ -24,6 +26,16 @@ class UserCacheService:
     def _watched_sets_key(token: str, content_type: str) -> str:
         """Generate cache key for watched sets."""
         return WATCHED_SETS_KEY.format(token=token, content_type=content_type)
+
+    @staticmethod
+    def _library_hash_key(token: str, content_type: str) -> str:
+        """Generate cache key for library hash."""
+        return f"watchly:library_hash:{token}:{content_type}"
+
+    @staticmethod
+    def _last_profile_build_key(token: str, content_type: str) -> str:
+        """Generate cache key for last profile build timestamp."""
+        return f"watchly:last_profile_build:{token}:{content_type}"
 
     # Library Items Methods
 
@@ -155,7 +167,11 @@ class UserCacheService:
         return None
 
     async def set_watched_sets(
-        self, token: str, content_type: str, watched_tmdb: set[int], watched_imdb: set[str]
+        self,
+        token: str,
+        content_type: str,
+        watched_tmdb: set[int],
+        watched_imdb: set[str],
     ) -> None:
         """
         Cache watched sets for a user and content type.
@@ -211,6 +227,74 @@ class UserCacheService:
         watched_tmdb, watched_imdb = watched_sets
         return (profile, watched_tmdb, watched_imdb)
 
+    # Library Change Detection Methods
+
+    async def has_library_changed(self, token: str, content_type: str, library_items: list) -> bool:
+        """
+        Check if library has changed since last profile build.
+
+        Args:
+            token: User token
+            content_type: Content type (movie or series)
+            library_items: Current library items list
+
+        Returns:
+            True if library has changed, False otherwise
+        """
+        # Create hash of current library item IDs
+        current_ids = [item.get("_id", item.get("id", "")) for item in library_items]
+        current_hash = hashlib.md5("".join(sorted(current_ids)).encode()).hexdigest()
+
+        # Compare with stored hash
+        stored_hash = await redis_service.get(self._library_hash_key(token, content_type))
+
+        if stored_hash is None:
+            # No stored hash, consider it changed
+            return True
+
+        return current_hash != stored_hash.decode() if isinstance(stored_hash, bytes) else current_hash != stored_hash
+
+    async def update_library_hash(self, token: str, content_type: str, library_items: list) -> None:
+        """
+        Update the stored library hash after successful profile build.
+
+        Args:
+            token: User token
+            content_type: Content type (movie or series)
+            library_items: Current library items list
+        """
+        current_ids = [item.get("_id", item.get("id", "")) for item in library_items]
+        current_hash = hashlib.md5("".join(sorted(current_ids)).encode()).hexdigest()
+
+        hash_key = self._library_hash_key(token, content_type)
+        build_time_key = self._last_profile_build_key(token, content_type)
+
+        # Store hash and build timestamp
+        await redis_service.set(hash_key, current_hash)
+        await redis_service.set(build_time_key, str(time.time()))
+
+        logger.debug(f"[{redact_token(token)}...] Updated library hash for {content_type}")
+
+    async def get_last_profile_build_time(self, token: str, content_type: str) -> int | None:
+        """
+        Get the timestamp of the last profile build.
+
+        Args:
+            token: User token
+            content_type: Content type (movie or series)
+
+        Returns:
+            Unix timestamp of last build, or None if never built
+        """
+        build_time = await redis_service.get(self._last_profile_build_key(token, content_type))
+        if build_time is None:
+            return None
+
+        try:
+            return int(float(build_time.decode() if isinstance(build_time, bytes) else build_time))
+        except (ValueError, TypeError):
+            return None
+
     async def set_profile_and_watched_sets(
         self,
         token: str,
@@ -253,7 +337,7 @@ class UserCacheService:
         await self.invalidate_all_catalogs(token)
         logger.debug(f"[{redact_token(token)}...] Invalidated all user data cache")
 
-    async def get_catalog(self, token: str, type: str, id: str) -> dict[str, Any] | None:
+    async def get_catalog(self, token: str, type: str, id: str) -> tuple[dict[str, Any], int] | None:
         """
         Get cached catalog for a user and content type.
 
@@ -261,15 +345,32 @@ class UserCacheService:
             token: User token
             type: Content type (movie or series)
             id: Catalog ID
+
+        Returns:
+            Tuple of (catalog_data, timestamp) or None if not found
         """
         key = CATALOG_KEY.format(token=token, type=type, id=id)
         cached = await redis_service.get(key)
         if cached:
-            return json.loads(cached)
+            try:
+                data = json.loads(cached)
+                # Handle new format with timestamp wrapper
+                if "data" in data and "created_at" in data:
+                    return data["data"], data["created_at"]
+                # Handle legacy format (raw catalog dict)
+                # Return 0 timestamp to force refresh if it exceeds window
+                return data, 0
+            except json.JSONDecodeError:
+                return None
         return None
 
     async def set_catalog(
-        self, token: str, type: str, id: str, catalog: dict[str, Any], ttl: int | None = None
+        self,
+        token: str,
+        type: str,
+        id: str,
+        catalog: dict[str, Any],
+        ttl: int | None = None,
     ) -> None:
         """
         Cache catalog for a user and content type.
@@ -282,7 +383,12 @@ class UserCacheService:
             ttl: Time to live for the cache (in seconds)
         """
         key = CATALOG_KEY.format(token=token, type=type, id=id)
-        await redis_service.set(key, json.dumps(catalog), ttl)
+        # Store with timestamp for stale-while-revalidate logic
+        wrapped_data = {
+            "data": catalog,
+            "created_at": int(time.time()),
+        }
+        await redis_service.set(key, json.dumps(wrapped_data), ttl)
         logger.debug(f"[{redact_token(token)}...] Cached catalog for {type}/{id}")
 
     async def invalidate_catalog(self, token: str, type: str, id: str) -> None:

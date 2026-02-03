@@ -164,6 +164,11 @@ class TokenStore:
         # Remove it since we've migrated to poster_rating or it's no longer needed
         if "rpdb_key" in settings_dict:
             settings_dict.pop("rpdb_key")
+            # keep empty poster_rating field for now
+            settings_dict["poster_rating"] = {
+                "provider": "rpdb",
+                "api_key": None,
+            }
             if not needs_save:  # Only log if we didn't already log migration
                 logger.info(f"[MIGRATION] Removing deprecated rpdb_key field for {redact_token(token)}")
             needs_save = True
@@ -244,12 +249,12 @@ class TokenStore:
             poster_rating = data["settings"].get("poster_rating")
             if poster_rating and isinstance(poster_rating, dict) and poster_rating.get("api_key"):
                 try:
-                    poster_rating["api_key"] = self.decrypt_token(poster_rating["api_key"])
+                    if poster_rating["api_key"].startswith("gAAAAA"):
+                        poster_rating["api_key"] = self.decrypt_token(poster_rating["api_key"])
                 except Exception as e:
-                    logger.warning(
-                        "Decryption failed for poster_rating api_key associated " f"with {redact_token(token)}: {e}"
+                    logger.debug(
+                        f"Decryption failed for poster_rating api_key associated with {redact_token(token)}: {e}"
                     )
-                    poster_rating["api_key"] = None
 
         return data
 

@@ -12,6 +12,7 @@ from app.services.recommendation.scoring import RecommendationScoring
 from app.services.recommendation.utils import (
     content_type_to_mtype,
     filter_by_genres,
+    filter_items_by_settings,
     filter_watched_by_imdb,
     resolve_tmdb_id,
 )
@@ -111,6 +112,9 @@ class AllBasedService:
         # Convert to list
         candidates = list(all_candidates.values())
 
+        # Apply global settings filter (years, popularity)
+        candidates = filter_items_by_settings(candidates, self.user_settings)
+
         # Filter by genres and watched items
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
         whitelist = whitelist or set()
@@ -119,8 +123,9 @@ class AllBasedService:
         logger.info(f"Filtered {len(filtered)} candidates")
 
         # Score with profile if available
+        scored = []
         if profile:
-            scored = []
+            rotation_seed = RecommendationScoring.generate_rotation_seed()  # Daily rotation for fresh recommendations
             for item in filtered:
                 try:
                     final_score = RecommendationScoring.calculate_final_score(
@@ -128,6 +133,7 @@ class AllBasedService:
                         profile=profile,
                         scorer=self.scorer,
                         mtype=mtype,
+                        rotation_seed=rotation_seed,
                     )
 
                     # Apply genre multiplier (if whitelist available)
@@ -142,8 +148,12 @@ class AllBasedService:
             # Sort by score
             scored.sort(key=lambda x: x[0], reverse=True)
             filtered = [item for _, item in scored]
+        else:
+            # No profile - just use filtered items sorted by popularity/rating
+            logger.info("No profile available, sorting by popularity")
+            filtered = sorted(filtered, key=lambda x: x.get("popularity", 0) * x.get("vote_average", 0), reverse=True)
 
-        logger.info(f"Scored {len(scored)} candidates")
+        logger.info(f"Scored {len(scored) if scored else len(filtered)} candidates")
 
         # Enrich metadata
         enriched = await RecommendationMetadata.fetch_batch(
