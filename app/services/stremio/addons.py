@@ -61,6 +61,25 @@ class StremioAddonService:
             logger.exception(f"Failed to update addon collection: {e}")
             return False
 
+    async def update_description(self, auth_key: str, description: str) -> bool:
+        """Update only the addon description."""
+        addons = await self.get_addons(auth_key)
+
+        found = False
+        for addon in addons:
+            if addon.get("manifest", {}).get("id") == settings.ADDON_ID and match_hostname(
+                addon.get("transportUrl"), settings.HOST_NAME
+            ):
+                addon["manifest"]["description"] = description
+                found = True
+                break
+
+        if not found:
+            logger.warning(f"Addon {settings.ADDON_ID} not found in user collection; cannot update description.")
+            return False
+
+        return await self.update_addon_collection(auth_key, addons)
+
     async def update_catalogs(self, auth_key: str, catalogs: list[dict[str, Any]]) -> bool:
         """
         Inject dynamic catalogs into the installed Watchly addon.
@@ -75,9 +94,10 @@ class StremioAddonService:
             ):
                 addon["manifest"]["catalogs"] = catalogs
                 # also update description with updated time
+                now_str = datetime.now(timezone.utc).strftime("%d %B %Y, %H:%M:%S")
                 addon["manifest"]["description"] = (
-                    "Movie and series recommendations based on your Stremio library.\nLast Updated on: "
-                    f" {datetime.now(timezone.utc).strftime('%d %B %Y, %H:%M:%S')} UTC"
+                    "Movie and series recommendations based on your Stremio library.\n\n"
+                    f"✅ Last Updated: {now_str} UTC"
                 )
                 found = True
                 break

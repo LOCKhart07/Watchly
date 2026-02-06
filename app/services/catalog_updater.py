@@ -155,6 +155,14 @@ class CatalogUpdater:
 
         except Exception as e:
             logger.exception(f"[{redact_token(token)}] Failed to update catalogs in background: {e}")
+            try:
+                error_msg = f"Failed to update catalogs: {str(e)}"
+                description = (
+                    f"Movie and series recommendations based on your Stremio library.\n\n⚠️ Status: Error\n{error_msg}"
+                )
+                await bundle.addons.update_description(auth_key, description)
+            except Exception as update_err:
+                logger.warning(f"[{redact_token(token)}] Failed to update addon description with error: {update_err}")
             return False
         finally:
             await bundle.close()
