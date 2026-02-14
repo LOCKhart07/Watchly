@@ -6,7 +6,9 @@ from httpx import AsyncClient
 from loguru import logger
 
 
-def get_popularity(rank: int, N: int = 100000, K: int = 100) -> float:
+def get_popularity(rank: int | None, N: int = 100000, K: int = 100) -> float:
+    if rank is None:
+        rank = 50000
     return (N - rank + 1) / N * K
 
 
