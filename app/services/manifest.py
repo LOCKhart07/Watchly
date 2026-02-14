@@ -138,7 +138,7 @@ class ManifestService:
             await user_cache.set_library_items(token, library_items)
 
         dynamic_catalog_service = DynamicCatalogService(language=user_settings.language)
-        return await dynamic_catalog_service.get_dynamic_catalogs(library_items, user_settings)
+        return await dynamic_catalog_service.get_dynamic_catalogs(library_items, user_settings, token=token)
 
     async def _translate_catalogs(self, catalogs: list[dict[str, Any]], language: str | None) -> list[dict[str, Any]]:
         """Translate catalog names to target language."""

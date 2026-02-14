@@ -119,7 +119,7 @@ class CatalogUpdater:
             )
 
             catalogs = await dynamic_catalog_service.get_dynamic_catalogs(
-                library_items=library_items, user_settings=user_settings
+                library_items=library_items, user_settings=user_settings, token=token
             )
 
             # Translate catalogs

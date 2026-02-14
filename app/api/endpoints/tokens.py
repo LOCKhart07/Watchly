@@ -33,6 +33,7 @@ class TokenRequest(BaseModel):
         default="default", description="Order of movies and series catalogs"
     )
     simkl_api_key: str | None = Field(default=None, description="Simkl API Key for the user")
+    gemini_api_key: str | None = Field(default=None, description="Gemini API Key for AI features")
 
 
 class TokenResponse(BaseModel):
@@ -100,6 +101,7 @@ async def create_token(payload: TokenRequest, request: Request) -> TokenResponse
         popularity=payload.popularity,
         sorting_order=payload.sorting_order,
         simkl_api_key=payload.simkl_api_key,
+        gemini_api_key=payload.gemini_api_key,
     )
 
     # 4. Prepare payload to store

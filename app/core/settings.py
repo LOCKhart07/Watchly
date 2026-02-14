@@ -39,6 +39,7 @@ class UserSettings(BaseModel):
         default="default", description="Order of movies and series catalogs"
     )
     simkl_api_key: str | None = Field(default=None, description="Simkl API Key for the user")
+    gemini_api_key: str | None = Field(default=None, description="Gemini API Key for AI-powered features")
 
 
 # Catalog descriptions for frontend

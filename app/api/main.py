@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from .endpoints.announcement import router as announcement_router
 from .endpoints.catalogs import router as catalogs_router
+from .endpoints.gemini_validation import router as gemini_validation_router
 from .endpoints.health import router as health_router
 from .endpoints.manifest import router as manifest_router
 from .endpoints.meta import router as meta_router
@@ -27,3 +28,4 @@ api_router.include_router(announcement_router)
 api_router.include_router(stats_router)
 api_router.include_router(poster_rating_router)
 api_router.include_router(simkl_router)
+api_router.include_router(gemini_validation_router)

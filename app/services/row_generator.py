@@ -13,7 +13,7 @@ from enum import Enum
 from typing import Any
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.taste_profile import TasteProfile
 from app.services.gemini import gemini_service
@@ -143,6 +143,15 @@ class RowDefinition(BaseModel):
         return len(self.axes) > 0
 
 
+class LLMRowTheme(BaseModel):
+    """Schema for structured LLM output - a single themed catalog row."""
+
+    title: str = Field(description="Creative, short title for the collection (2-5 words)")
+    genres: list[int] = Field(description="List of valid TMDB genre IDs")
+    keywords: list[str] = Field(default_factory=list, description="Specific TMDB keyword names")
+    country: str | None = Field(default=None, description="ISO 3166-1 country code or null")
+
+
 class RowComponents(BaseModel):
     """Internal structure for building a row."""
 
@@ -257,10 +266,13 @@ class RowGeneratorService:
     def __init__(self, tmdb_service: TMDBService | None = None):
         self.tmdb_service = tmdb_service or get_tmdb_service()
 
-    async def generate_rows(self, profile: TasteProfile, content_type: str = "movie") -> list[RowDefinition]:
+    async def generate_rows(
+        self, profile: TasteProfile, content_type: str = "movie", api_key: str | None = None
+    ) -> list[RowDefinition]:
         """
-        Generate exactly 3 personalized catalog rows: One Core, One Blend, One Rising Star.
-        Total 6 rows across both content types (movie/series).
+        Generate exactly 3 personalized catalog rows.
+        If api_key is provided, uses LLM to generate creative themes.
+        Otherwise uses tiered sampling system.
 
         Returns:
             List of RowDefinition
@@ -268,7 +280,17 @@ class RowGeneratorService:
         # 1. Extract all features from profile
         features = await self._extract_features(profile, content_type)
 
-        # 2. Build exactly one of each persona with inter-row diversity
+        # 2. Try LLM generation if key is present
+        if api_key:
+            try:
+                llm_rows = await self._generate_rows_with_llm(profile, features, content_type, api_key)
+                if llm_rows:
+                    logger.info(f"Generated {len(llm_rows)} LLM-driven rows for {content_type}")
+                    return llm_rows
+            except Exception as e:
+                logger.warning(f"LLM row generation failed, falling back to tiered sampling: {e}")
+
+        # 3. Fallback to Tiered Sampling
         rows_data = []
         used_genres = set()
         used_keywords = set()
@@ -290,11 +312,10 @@ class RowGeneratorService:
         if rising_row:
             rows_data.append(rising_row)
 
-        # 3. Generate titles via Gemini (parallel)
-        # We limit to 3 rows total per call
+        # 4. Generate titles via server's default Gemini model (gemma)
         final_rows = await self._generate_titles(rows_data[:3])
 
-        logger.info(f"Generated {len(final_rows)} dynamic rows (Core/Blend/Rising) for {content_type}")
+        logger.info(f"Generated {len(final_rows)} dynamic rows (Tiered Sampling) for {content_type}")
         return final_rows
 
     def _update_used_axes(self, row: RowComponents, used_genres: set, used_keywords: set):
@@ -488,11 +509,11 @@ class RowGeneratorService:
         return signature_rows
 
     async def _generate_titles(self, rows_data: list[RowComponents]) -> list[RowDefinition]:
-        """Generate titles for all rows via Gemini."""
+        """Generate titles for tiered sampling rows via server's default Gemini model."""
         if not rows_data:
             return []
 
-        # Build prompts and fire Gemini requests
+        # Build prompts and fire Gemini requests (uses server key + default model)
         prompts = [row.build_prompt() for row in rows_data]
         gemini_tasks = [gemini_service.generate_content_async(p) for p in prompts]
         results = await asyncio.gather(*gemini_tasks, return_exceptions=True)
@@ -522,3 +543,116 @@ class RowGeneratorService:
             )
 
         return final_rows
+
+    async def _resolve_keyword_to_id(self, kw_name: str, profile_kw_map: dict[str, int]) -> int | None:
+        """Resolve a keyword name to TMDB ID: profile first, then TMDB search (for discovery)."""
+        kw_lower = str(kw_name).strip().lower()
+        if not kw_lower:
+            return None
+        if kw_lower in profile_kw_map:
+            return profile_kw_map[kw_lower]
+        try:
+            data = await self.tmdb_service.search_keywords(kw_lower)
+            results = data.get("results") or []
+            if results:
+                first = results[0]
+                kid = first.get("id") if isinstance(first, dict) else getattr(first, "id", None)
+                if kid is not None:
+                    return int(kid)
+        except Exception:
+            pass
+        return None
+
+    async def _generate_rows_with_llm(
+        self,
+        profile: TasteProfile,
+        features: ExtractedFeatures,
+        content_type: str,
+        api_key: str,
+    ) -> list[RowDefinition] | None:
+        """Generate rows from the user's interest summary; balance personalization with discovery."""
+        try:
+            summary = profile.interest_summary or "No summary available."
+
+            current_genre_map = movie_genres if content_type == "movie" else series_genres
+            valid_genre_list = ", ".join([f"{name} (ID: {gid})" for gid, name in current_genre_map.items()])
+
+            profile_keywords = [name for k_id, _ in features.keywords[:12] if (name := features.get_keyword_name(k_id))]
+            keyword_hint = (
+                (
+                    f"Themes they already like (you can use these): {', '.join(profile_keywords)}. "
+                    if profile_keywords
+                    else ""
+                )
+                + "You can also suggest new themes for discovery—especially for Rising Star—"
+                "e.g. adjacent genres or topics they might not have tried yet. We will resolve keywords."
+            )
+
+            prompt = (
+                "Using only the user's interest summary below, generate exactly 3 streaming collections for"
+                f" {content_type}. Use genres (required), keywords, and country when relevant.\n\nInterest"
+                f" Summary:\n{summary}\n\nGenerate 3 rows in this order:\n1. THE CORE — What they will love"
+                " most: strongest match to their taste (genres + keywords + country if relevant).\n2. MIXED"
+                " PREFERENCES — Blend of their tastes with more variety (genres + keywords + country if"
+                " relevant).\n3. RISING STAR — Discovery: suggest themes they might not have explored yet but"
+                " would likely enjoy (adjacent to their taste, or natural next step). Use genres + keywords +"
+                " country; openness to new content here.\n\nRules:\n- Genres: use ONLY these TMDB Genre IDs:"
+                f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ISO 3166-1 code (e.g. US, KR, JP)"
+                " or null when relevant.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
+                " of strings), country (string or null).\n- Output a JSON array of 3 objects."
+            )
+
+            data = await gemini_service.generate_structured_async(
+                prompt=prompt,
+                response_schema=list[LLMRowTheme],
+                system_instruction=(
+                    "You are a creative film curator. Design 3 catalog rows from the user's interest summary."
+                    " Row 1 (The Core): strong match. Row 2 (Mixed): blend + variety. Row 3 (Rising Star):"
+                    " discovery—suggest new content they would enjoy, not just more of the same. Use genres,"
+                    " keywords, and country. Output valid JSON only."
+                ),
+                api_key=api_key,
+            )
+
+            if not data or not isinstance(data, list):
+                return None
+
+            final_rows = []
+            profile_kw_map = {name.lower(): kid for kid, name in features.keyword_names.items()}
+
+            for item in data:
+                if isinstance(item, dict):
+                    title = item.get("title", "Recommended")
+                    genre_ids = item.get("genres", [])
+                    kw_names = item.get("keywords", [])
+                    country = item.get("country")
+                else:
+                    title = item.title
+                    genre_ids = item.genres
+                    kw_names = item.keywords
+                    country = item.country
+
+                builder = RowBuilder(features)
+
+                for gid in genre_ids:
+                    if int(gid) in current_genre_map:
+                        builder.add_axis(AXIS_GENRE, int(gid), AxisRole.ANCHOR)
+
+                for kw_name in kw_names:
+                    kid = await self._resolve_keyword_to_id(kw_name, profile_kw_map)
+                    if kid is not None:
+                        builder.add_axis(AXIS_KEYWORD, kid, AxisRole.FLAVOR)
+
+                if country:
+                    builder.add_axis(AXIS_COUNTRY, country, AxisRole.FLAVOR)
+
+                row_comp = builder.build()
+                if row_comp and row_comp.axes:
+                    row_id = build_row_id(row_comp.axes)
+                    final_rows.append(RowDefinition(title=title, id=row_id, axes=row_comp.axes))
+
+            return final_rows if final_rows else None
+
+        except Exception as e:
+            logger.warning(f"Error in _generate_rows_with_llm: {e}")
+            return None
