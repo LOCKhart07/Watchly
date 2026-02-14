@@ -37,7 +37,6 @@ class BaseClient:
         """Internal request handler with retry logic."""
         client = await self.get_client()
         tries = max_tries or self.max_retries
-        last_exception = None
 
         for attempt in range(1, tries + 1):
             try:
@@ -45,8 +44,15 @@ class BaseClient:
                 response.raise_for_status()
                 return response
             except (httpx.HTTPStatusError, httpx.RequestError) as e:
-                last_exception = e
-                if attempt < tries:
+
+                # Check if the error is retryable
+                is_retryable = True
+                if isinstance(e, httpx.HTTPStatusError):
+                    # Only retry on 429 (Rate Limit) and 5xx (Server Errors)
+                    # 404, 400, 401, etc. are not retryable
+                    is_retryable = e.response.status_code in (429, 500, 502, 503, 504)
+
+                if is_retryable and attempt < tries:
                     wait_time = 0.5 * (2 ** (attempt - 1))  # Exponential backoff
                     logger.warning(
                         f"Request failed ({method} {url}): {str(e)}. "
@@ -54,11 +60,14 @@ class BaseClient:
                     )
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error(f"Request failed after {tries} attempts: {str(e)}")
+                    # If not retryable or no more attempts left, log and raise
+                    if not is_retryable:
+                        logger.error(f"Non-retryable request failure ({method} {url}): {str(e)}")
+                    else:
+                        logger.error(f"Request failed after {tries} attempts ({method} {url}): {str(e)}")
+                    raise e
 
-        if last_exception:
-            raise last_exception
-        raise httpx.RequestError("Request failed for unknown reasons")
+        raise httpx.RequestError(f"Request failed for {method} {url} with 0 attempts configured")
 
     async def get(self, url: str, params: dict[str, Any] | None = None, **kwargs) -> dict[str, Any]:
         """Perform a GET request and return the JSON response."""
