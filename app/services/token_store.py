@@ -103,6 +103,36 @@ class TokenStore:
                         poster_rating["api_key"] = self.encrypt_token(api_key)
                 except Exception as exc:
                     logger.warning(f"Failed to encrypt poster_rating api_key for {redact_token(user_id)}: {exc}")
+
+        # Encrypt simkl_api_key if present
+        if storage_data.get("settings") and isinstance(storage_data["settings"], dict):
+            simkl_api_key = storage_data["settings"].get("simkl_api_key")
+            if simkl_api_key:
+                try:
+                    if not simkl_api_key.startswith("gAAAAAB"):
+                        storage_data["settings"]["simkl_api_key"] = self.encrypt_token(simkl_api_key)
+                except Exception as exc:
+                    logger.warning(f"Failed to encrypt simkl_api_key for {redact_token(user_id)}: {exc}")
+
+        # Encrypt gemini_api_key if present
+        if storage_data.get("settings") and isinstance(storage_data["settings"], dict):
+            gemini_api_key = storage_data["settings"].get("gemini_api_key")
+            if gemini_api_key:
+                try:
+                    if not gemini_api_key.startswith("gAAAAAB"):
+                        storage_data["settings"]["gemini_api_key"] = self.encrypt_token(gemini_api_key)
+                except Exception as exc:
+                    logger.warning(f"Failed to encrypt gemini_api_key for {redact_token(user_id)}: {exc}")
+
+        # Encrypt tmdb_api_key if present
+        if storage_data.get("settings") and isinstance(storage_data["settings"], dict):
+            tmdb_api_key = storage_data["settings"].get("tmdb_api_key")
+            if tmdb_api_key:
+                try:
+                    if not tmdb_api_key.startswith("gAAAAAB"):
+                        storage_data["settings"]["tmdb_api_key"] = self.encrypt_token(tmdb_api_key)
+                except Exception as exc:
+                    logger.warning(f"Failed to encrypt tmdb_api_key for {redact_token(user_id)}: {exc}")
         json_str = json.dumps(storage_data)
 
         if settings.TOKEN_TTL_SECONDS and settings.TOKEN_TTL_SECONDS > 0:
@@ -255,6 +285,30 @@ class TokenStore:
                     logger.debug(
                         f"Decryption failed for poster_rating api_key associated with {redact_token(token)}: {e}"
                     )
+
+            simkl_api_key = data["settings"].get("simkl_api_key")
+            if simkl_api_key:
+                try:
+                    if simkl_api_key.startswith("gAAAAA"):
+                        data["settings"]["simkl_api_key"] = self.decrypt_token(simkl_api_key)
+                except Exception as e:
+                    logger.debug(f"Decryption failed for simkl_api_key associated with {redact_token(token)}: {e}")
+
+            gemini_api_key = data["settings"].get("gemini_api_key")
+            if gemini_api_key:
+                try:
+                    if gemini_api_key.startswith("gAAAAA"):
+                        data["settings"]["gemini_api_key"] = self.decrypt_token(gemini_api_key)
+                except Exception as e:
+                    logger.debug(f"Decryption failed for gemini_api_key associated with {redact_token(token)}: {e}")
+
+            tmdb_api_key = data["settings"].get("tmdb_api_key")
+            if tmdb_api_key:
+                try:
+                    if tmdb_api_key.startswith("gAAAAA"):
+                        data["settings"]["tmdb_api_key"] = self.decrypt_token(tmdb_api_key)
+                except Exception as e:
+                    logger.debug(f"Decryption failed for tmdb_api_key associated with {redact_token(token)}: {e}")
 
         return data
 

@@ -16,6 +16,7 @@ from app.services.recommendation.utils import (
     filter_watched_by_imdb,
     resolve_tmdb_id,
 )
+from app.services.simkl import simkl_service
 from app.services.tmdb.service import TMDBService
 
 TOP_ITEMS_LIMIT = 10
@@ -80,40 +81,61 @@ class AllBasedService:
 
         mtype = content_type_to_mtype(content_type)
 
-        # Fetch recommendations for each item in parallel
+        # Fetch recommendations
         all_candidates = {}
-        tasks = []
 
-        logger.info(f"Fetching recommendations for {len(top_items)} top items")
+        simkl_candidates = []
+        tmdb_candidates = []
 
-        for item in top_items:
-            item_id = item.get("_id", "")
-            if not item_id:
-                continue
+        # Use Simkl if API key available, otherwise fall back to TMDB
+        simkl_api_key = self.user_settings.simkl_api_key if self.user_settings else None
+        if simkl_api_key:
+            simkl_candidates = await self._fetch_simkl_candidates(top_items, mtype)
+            if simkl_candidates:
+                for candidate in simkl_candidates:
+                    candidate_id = candidate.get("id")
+                    if candidate_id:
+                        all_candidates[candidate_id] = candidate
+                logger.info(f"Fetched {len(all_candidates)} candidates from Simkl")
+                # filter simkl candidates
+                simkl_candidates = list(all_candidates.values())
+                simkl_candidates = filter_items_by_settings(simkl_candidates, self.user_settings, simkl=True)
+                logger.info(f"Total {len(simkl_candidates)} after filtering")
+            else:
+                logger.info("Simkl returned no results, falling back to TMDB")
 
-            # Resolve TMDB ID and fetch recommendations
-            tasks.append(self._fetch_recommendations_for_item(item_id, mtype))
+        # Fall back to TMDB if no Simkl key or Simkl returned nothing
+        if not simkl_candidates:
+            all_candidates = {}
+            tasks = []
+            logger.info(f"Fetching TMDB recommendations for {len(top_items)} top items")
 
-        # Execute all in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            for item in top_items:
+                item_id = item.get("_id", "")
+                if not item_id:
+                    continue
+                tasks.append(self._fetch_recommendations_for_item(item_id, mtype))
 
-        # Combine all recommendations (deduplicate by TMDB ID)
-        for res in results:
-            if isinstance(res, Exception):
-                logger.debug(f"Error fetching recommendations: {res}")
-                continue
-            for candidate in res:
-                candidate_id = candidate.get("id")
-                if candidate_id:
-                    all_candidates[candidate_id] = candidate
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        logger.info(f"Fetched {len(all_candidates)} candidates")
+            for res in results:
+                if isinstance(res, Exception):
+                    logger.debug(f"Error fetching recommendations: {res}")
+                    continue
+                for candidate in res:
+                    candidate_id = candidate.get("id")
+                    if candidate_id:
+                        all_candidates[candidate_id] = candidate
 
-        # Convert to list
-        candidates = list(all_candidates.values())
+            logger.info(f"Fetched {len(all_candidates)} candidates from TMDB")
 
-        # Apply global settings filter (years, popularity)
-        candidates = filter_items_by_settings(candidates, self.user_settings)
+            # Convert to list
+            tmdb_candidates = list(all_candidates.values())
+
+            # Apply global settings filter (years, popularity)
+            tmdb_candidates = filter_items_by_settings(tmdb_candidates, self.user_settings)
+
+        candidates = simkl_candidates + tmdb_candidates
 
         # Filter by genres and watched items
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
@@ -168,9 +190,52 @@ class AllBasedService:
         # Return top N
         return final
 
+    async def _fetch_simkl_candidates(self, top_items: list[dict[str, Any]], mtype: str) -> list[dict[str, Any]]:
+        """
+        Fetch recommendations from Simkl for loved/liked items.
+
+        Args:
+            top_items: List of library items
+            mtype: Media type (movie/tv)
+
+        Returns:
+            List of normalized Simkl candidates
+        """
+        simkl_api_key = self.user_settings.simkl_api_key if self.user_settings else None
+        if not simkl_api_key:
+            return []
+
+        # Extract IMDB IDs
+        imdb_ids = []
+        for item in top_items:
+            item_id = item.get("_id", "")
+            if item_id and item_id.startswith("tt"):
+                imdb_ids.append(item_id)
+
+        if not imdb_ids:
+            logger.warning("No valid IMDB IDs found for Simkl recommendations")
+            return []
+
+        # Get year range for early filtering
+        year_min = getattr(self.user_settings, "year_min", None)
+        year_max = getattr(self.user_settings, "year_max", None)
+
+        try:
+            return await simkl_service.get_recommendations_batch(
+                imdb_ids,
+                mtype,
+                simkl_api_key,
+                max_per_item=8,
+                year_min=year_min,
+                year_max=year_max,
+            )
+        except Exception as e:
+            logger.error(f"Error fetching Simkl recommendations: {e}")
+            return []
+
     async def _fetch_recommendations_for_item(self, item_id: str, mtype: str) -> list[dict[str, Any]]:
         """
-        Fetch recommendations for a single item.
+        Fetch recommendations for a single item from TMDB.
 
         Args:
             item_id: Item ID (tt... or tmdb:...)

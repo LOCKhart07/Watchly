@@ -100,6 +100,13 @@ class TMDBService:
         return await self.client.get(f"/keyword/{keyword_id}")
 
     @alru_cache(maxsize=500, ttl=86400)
+    async def search_keywords(self, query: str, page: int = 1) -> dict[str, Any]:
+        """Search keywords by name. Returns { results: [ { id, name } ], ... }."""
+        if not (query or str(query).strip()):
+            return {"results": []}
+        return await self.client.get("/search/keyword", params={"query": str(query).strip(), "page": page})
+
+    @alru_cache(maxsize=500, ttl=86400)
     async def get_person_details(self, person_id: int) -> dict[str, Any]:
         """Get details of a specific person (actor/director)."""
         return await self.client.get(f"/person/{person_id}")
@@ -132,8 +139,11 @@ class TMDBService:
         return await self.client.get("/configuration/primary_translations")
 
 
-@functools.lru_cache(maxsize=16)
-def get_tmdb_service(language: str = "en-US") -> TMDBService:
+@functools.lru_cache(maxsize=128)
+def get_tmdb_service(language: str = "en-US", api_key: str | None = None) -> TMDBService:
     from app.core.config import settings
 
-    return TMDBService(api_key=settings.TMDB_API_KEY, language=language)
+    key = api_key or settings.TMDB_API_KEY
+    if not key:
+        raise ValueError("TMDB API key is required (set in settings or TMDB_API_KEY env).")
+    return TMDBService(api_key=key, language=language)

@@ -252,6 +252,23 @@ async function fetchStremioIdentity(authKey) {
         payload.email = emailInput.value.trim();
         payload.password = passwordInput.value;
     }
+
+    const sortingOrderSelect = document.getElementById("sortingOrderSelect");
+    if (sortingOrderSelect) {
+        payload.sorting_order = sortingOrderSelect.value;
+    }
+    const tmdbApiKeyInput = document.getElementById("tmdbApiKey");
+    if (tmdbApiKeyInput) {
+        payload.tmdb_api_key = tmdbApiKeyInput.value.trim();
+    }
+    const simklApiKeyInput = document.getElementById("simklApiKey");
+    if (simklApiKeyInput) {
+        payload.simkl_api_key = simklApiKeyInput.value.trim();
+    }
+    const geminiApiKeyInput = document.getElementById("geminiApiKey");
+    if (geminiApiKeyInput) {
+        payload.gemini_api_key = geminiApiKeyInput.value.trim();
+    }
     const res = await fetch('/tokens/stremio-identity', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -287,6 +304,9 @@ async function fetchStremioIdentity(authKey) {
             if (s.year_max && yearMaxInput) yearMaxInput.value = s.year_max;
             if (window.updateYearSlider) window.updateYearSlider();
 
+            const sortingOrderSelect = document.getElementById('sortingOrderSelect');
+            if (s.sorting_order && sortingOrderSelect) sortingOrderSelect.value = s.sorting_order;
+
             // Handle poster rating: prefer new format, fallback to old rpdb_key
             const posterRatingProvider = document.getElementById('posterRatingProvider');
             const posterRatingApiKey = document.getElementById('posterRatingApiKey');
@@ -305,6 +325,15 @@ async function fetchStremioIdentity(authKey) {
                     posterRatingProvider.dispatchEvent(new Event('change'));
                 }
             }
+
+            const tmdbApiKeyInput = document.getElementById('tmdbApiKey');
+            if (s.tmdb_api_key && tmdbApiKeyInput) tmdbApiKeyInput.value = s.tmdb_api_key;
+
+            const simklApiKeyInput = document.getElementById('simklApiKey');
+            if (s.simkl_api_key && simklApiKeyInput) simklApiKeyInput.value = s.simkl_api_key;
+
+            const geminiApiKeyInput = document.getElementById('geminiApiKey');
+            if (s.gemini_api_key && geminiApiKeyInput) geminiApiKeyInput.value = s.gemini_api_key;
 
             // Genres (Checked = Excluded)
             document.querySelectorAll('input[name="movie-genre"]').forEach(cb => cb.checked = false);

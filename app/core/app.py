@@ -11,7 +11,7 @@ from jinja2 import Environment, FileSystemLoader
 from loguru import logger
 
 from app.api.endpoints.meta import fetch_languages_list
-from app.api.main import api_router
+from app.api.router import api_router
 from app.core.settings import get_default_catalogs_for_frontend
 from app.services.redis_service import redis_service
 from app.services.tmdb.genre import movie_genres, series_genres
@@ -106,6 +106,13 @@ async def configure_page(request: Request, _token: str | None = None):
         logger.warning(f"Failed to fetch languages for template: {e}")
         languages = [{"iso_639_1": "en-US", "language": "English", "country": "US"}]
 
+    # Get total users count
+    total_users = 0
+    try:
+        total_users = await token_store.count_users()
+    except Exception as e:
+        logger.warning(f"Failed to get total users for template: {e}")
+
     # Format default catalogs for frontend
     default_catalogs = get_default_catalogs_for_frontend()
 
@@ -117,6 +124,7 @@ async def configure_page(request: Request, _token: str | None = None):
     html_content = template.render(
         request=request,
         app_version=__version__,
+        total_users=total_users,
         app_host=settings.HOST_NAME,
         announcement_html=settings.ANNOUNCEMENT_HTML or "",
         languages=languages,

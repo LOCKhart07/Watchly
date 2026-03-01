@@ -1,9 +1,12 @@
-import asyncio
+import json
 
 from google import genai
+from google.genai import types
 from loguru import logger
 
 from app.core.config import settings
+
+FLASH_MODEL = "gemini-2.5-flash"
 
 
 class GeminiService:
@@ -39,25 +42,75 @@ class GeminiService:
         - Only return a single best title and nothing else.
         """
 
-    def generate_content(self, prompt: str) -> str:
-        system_prompt = self.get_prompt()
+    def _get_client(self, api_key: str | None = None) -> genai.Client | None:
+        if api_key:
+            try:
+                return genai.Client(api_key=api_key)
+            except Exception as e:
+                logger.error(f"Failed to create Gemini client with provided key: {e}")
+                return None
+        return self.client
+
+    async def generate_content_async(self, prompt: str) -> str:
         if not self.client:
-            logger.warning("Gemini client not initialized. Gemini features will be disabled.")
+            logger.warning("Gemini client not initialized (no key). Gemini features will be disabled.")
             return ""
+
         try:
-            response = self.client.models.generate_content(
+            response = await self.client.aio.models.generate_content(
                 model=self.model,
-                contents=system_prompt + "\n\n" + prompt,
+                contents=self.get_prompt() + "\n\n" + prompt,
             )
             return response.text.strip()
         except Exception as e:
-            logger.exception(f"Error generating content with Gemini: {e}")
+            logger.exception(f"Error generating title with Gemini: {e}")
             return ""
 
-    async def generate_content_async(self, prompt: str) -> str:
-        """Async wrapper to avoid blocking the event loop during network calls."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self.generate_content(prompt))
+    async def generate_flash_content_async(self, prompt: str, system_instruction: str, api_key: str) -> str:
+        client = self._get_client(api_key)
+        if not client:
+            return ""
+
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+            )
+            response = await client.aio.models.generate_content(
+                model=FLASH_MODEL,
+                contents=prompt,
+                config=config,
+            )
+            return response.text.strip()
+        except Exception as e:
+            logger.exception(f"Error generating content with Gemini Flash: {e}")
+            return ""
+
+    async def generate_structured_async(
+        self,
+        prompt: str,
+        response_schema: type | dict,
+        system_instruction: str,
+        api_key: str,
+    ) -> dict | list | None:
+        client = self._get_client(api_key)
+        if not client:
+            return None
+
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            )
+            response = await client.aio.models.generate_content(
+                model=FLASH_MODEL,
+                contents=prompt,
+                config=config,
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            logger.exception(f"Error generating structured content with Gemini Flash: {e}")
+            return None
 
 
 gemini_service = GeminiService()

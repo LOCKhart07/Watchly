@@ -1,5 +1,7 @@
 from typing import Any
 
+import httpx
+
 from app.models.scoring import ScoredItem
 from app.services.cinemeta_service import CinemetaService, cinemeta_service
 from app.services.profile.constants import (
@@ -132,6 +134,14 @@ class ItemVectorizer:
             # Transform to our format (pass metadata and item type for extraction)
             return await self._transform_vector(vector, metadata, item.item.type)
 
+        except httpx.HTTPStatusError as e:
+            from loguru import logger
+
+            if e.response.status_code == 404:
+                logger.debug(f"TMDB not found ({e.response.status_code}) for item {item.item.id}, skipping")
+            else:
+                logger.warning(f"TMDB error {e.response.status_code} for item {item.item.id}: {e}")
+            return None
         except Exception as e:
             from loguru import logger
 

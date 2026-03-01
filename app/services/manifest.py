@@ -5,7 +5,7 @@ from loguru import logger
 
 from app.core.config import settings
 from app.core.security import redact_token
-from app.core.settings import UserSettings
+from app.core.settings import UserSettings, resolve_tmdb_api_key
 from app.core.version import __version__
 from app.services.catalog import DynamicCatalogService
 from app.services.profile.integration import ProfileIntegration
@@ -13,7 +13,7 @@ from app.services.stremio.service import StremioBundle
 from app.services.token_store import token_store
 from app.services.translation import translation_service
 from app.services.user_cache import user_cache
-from app.utils.catalog import cache_profile_and_watched_sets, get_config_id
+from app.utils.catalog import cache_profile_and_watched_sets, sort_catalogs
 
 
 class ManifestService:
@@ -98,7 +98,8 @@ class ManifestService:
 
         # Build and cache profiles for both movie and series
         language = user_settings.language
-        integration_service = ProfileIntegration(language=language)
+        tmdb_key = resolve_tmdb_api_key(user_settings)
+        integration_service = ProfileIntegration(language=language, tmdb_api_key=tmdb_key)
 
         for content_type in ["movie", "series"]:
             try:
@@ -137,8 +138,9 @@ class ManifestService:
             library_items = await self._ensure_library_and_profiles_cached(bundle, auth_key, user_settings, token)
             await user_cache.set_library_items(token, library_items)
 
-        dynamic_catalog_service = DynamicCatalogService(language=user_settings.language)
-        return await dynamic_catalog_service.get_dynamic_catalogs(library_items, user_settings)
+        tmdb_key = resolve_tmdb_api_key(user_settings)
+        dynamic_catalog_service = DynamicCatalogService(language=user_settings.language, tmdb_api_key=tmdb_key)
+        return await dynamic_catalog_service.get_dynamic_catalogs(library_items, user_settings, token=token)
 
     async def _translate_catalogs(self, catalogs: list[dict[str, Any]], language: str | None) -> list[dict[str, Any]]:
         """Translate catalog names to target language."""
@@ -163,9 +165,7 @@ class ManifestService:
         if not user_settings:
             return catalogs
 
-        order_map = {c.id: i for i, c in enumerate(user_settings.catalogs)}
-        sorted_catalogs = sorted(catalogs, key=lambda x: order_map.get(get_config_id(x), 999))
-        return sorted_catalogs
+        return sort_catalogs(catalogs, user_settings)
 
     async def get_manifest_for_token(self, token: str) -> dict[str, Any]:
         """

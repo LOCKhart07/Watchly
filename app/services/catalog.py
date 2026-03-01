@@ -7,10 +7,12 @@ from loguru import logger
 
 from app.core.constants import DISCOVER_ONLY_EXTRA
 from app.core.settings import CatalogConfig, UserSettings
+from app.services.interest_summary import interest_summary_service
 from app.services.profile.integration import ProfileIntegration
 from app.services.row_generator import RowGeneratorService
 from app.services.scoring import ScoringService
 from app.services.tmdb.service import get_tmdb_service
+from app.services.user_cache import user_cache
 from app.utils.catalog import get_catalogs_from_config
 
 
@@ -19,10 +21,10 @@ class DynamicCatalogService:
     Generates dynamic catalog rows based on user library and preferences.
     """
 
-    def __init__(self, language: str = "en-US"):
-        self.tmdb_service = get_tmdb_service(language=language)
+    def __init__(self, language: str = "en-US", tmdb_api_key: str | None = None):
+        self.tmdb_service = get_tmdb_service(language=language, api_key=tmdb_api_key)
         self.scoring_service = ScoringService()
-        self.profile_integration = ProfileIntegration(language=language)
+        self.profile_integration = ProfileIntegration(language=language, tmdb_api_key=tmdb_api_key)
         self.row_generator = RowGeneratorService(tmdb_service=self.tmdb_service)
         self.PROFILE_MAX_ITEMS = 50
 
@@ -115,6 +117,7 @@ class DynamicCatalogService:
         enabled_movie: bool = True,
         enabled_series: bool = True,
         display_at_home: bool = True,
+        token: str | None = None,
     ) -> list[dict]:
         """Build thematic catalogs by profiling items using smart sampling."""
         # 1. Prepare Scored History using smart sampling (loved/liked + top watched by score)
@@ -123,12 +126,21 @@ class DynamicCatalogService:
         # 2. Extract Genre Filters
         excluded_movie_genres = []
         excluded_series_genres = []
+        gemini_api_key = None
         if user_settings:
             excluded_movie_genres = [int(g) for g in user_settings.excluded_movie_genres]
             excluded_series_genres = [int(g) for g in user_settings.excluded_series_genres]
+            gemini_api_key = user_settings.gemini_api_key
+
+        logger.info(
+            f"[Theme Catalogs] gemini_api_key={'SET' if gemini_api_key else 'NONE'},"
+            f" token={'SET' if token else 'NONE'}"
+        )
 
         # 3. Generate Rows
         async def _generate_for_type(media_type: str, genres: list[int]):
+            logger.info(f"[Theme Catalogs] _generate_for_type called for {media_type}")
+
             # Build profile using new system
             profile, _, _ = await self.profile_integration.build_profile_from_library(
                 library_items, media_type, None, None
@@ -137,8 +149,34 @@ class DynamicCatalogService:
                 logger.warning(f"Failed to build profile for {media_type}")
                 return media_type, []
 
+            # Generate interest summary if API key is present.
+            if gemini_api_key and token:
+                try:
+                    logger.info(f"Generating interest summary for {media_type}...")
+                    summary = await interest_summary_service.generate_summary(profile, gemini_api_key)
+                    if summary:
+                        profile.interest_summary = summary
+                        logger.info(f"Interest summary generated for {media_type}: {summary[:80]}...")
+                    else:
+                        logger.warning(f"Interest summary generation returned empty for {media_type}")
+                except Exception as e:
+                    logger.warning(f"Failed to generate interest summary for {media_type}: {e}")
+            else:
+                logger.info(
+                    f"[Theme Catalogs] Skipping summary: gemini_api_key={'SET' if gemini_api_key else 'NONE'},"
+                    f" token={'SET' if token else 'NONE'}"
+                )
+
+            # Always save the updated profile (with or without summary)
+            if token:
+                try:
+                    await user_cache.set_profile(token, media_type, profile)
+                    logger.info(f"Saved profile for {media_type} (has_summary={profile.interest_summary is not None})")
+                except Exception as e:
+                    logger.warning(f"Failed to save profile for {media_type}: {e}")
+
             try:
-                catalogs = await self.row_generator.generate_rows(profile, media_type)
+                catalogs = await self.row_generator.generate_rows(profile, media_type, api_key=gemini_api_key)
                 return media_type, catalogs
             except Exception as e:
                 logger.error(f"Failed to generate thematic rows for {media_type}: {e}")
@@ -166,7 +204,9 @@ class DynamicCatalogService:
 
         return catalogs
 
-    async def get_dynamic_catalogs(self, library_items: dict, user_settings: UserSettings | None = None) -> list[dict]:
+    async def get_dynamic_catalogs(
+        self, library_items: dict, user_settings: UserSettings | None = None, token: str | None = None
+    ) -> list[dict]:
         """Generate all dynamic catalog rows based on enabled configurations."""
         catalogs = []
         if not user_settings:
@@ -182,7 +222,7 @@ class DynamicCatalogService:
             enabled_series = getattr(theme_cfg, "enabled_series", True)
             display_at_home = getattr(theme_cfg, "display_at_home", True)
             theme_catalogs = await self.get_theme_based_catalogs(
-                library_items, user_settings, enabled_movie, enabled_series, display_at_home
+                library_items, user_settings, enabled_movie, enabled_series, display_at_home, token
             )
             catalogs.extend(theme_catalogs)
 
