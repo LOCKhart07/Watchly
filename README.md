@@ -71,13 +71,21 @@ You can pull the latest image from the GitHub Container Registry.
     HOST_NAME=your_addon_url
 
     # Optional
+    APP_ENV=production
     PORT=8000
-    REDIS_URL=redis://redis:6379/0
     ADDON_ID=com.bimal.watchly
     ADDON_NAME=Watchly
+    REDIS_URL=redis://redis:6379/0
     TOKEN_TTL_SECONDS=0
     AUTO_UPDATE_CATALOGS=true
+    CATALOG_REFRESH_INTERVAL_SECONDS=86400
+
+    # AI catalog name generation (optional)
+    GEMINI_API_KEY=your_gemini_api_key_here
+    DEFAULT_GEMINI_MODEL=gemma-3-27b-it
     ```
+
+    See [`.env.example`](.env.example) for the full list of configuration options.
 
 3.  **Start the application:**
 

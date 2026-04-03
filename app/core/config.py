@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     CATALOG_CACHE_TTL: int = 43200  # 12 hours
     CATALOG_STALE_TTL: int = 604800  # 7 days (soft expiration fallback)
 
+    # Subpath deployment (e.g. "/watchly" when behind a reverse proxy)
+    ROOT_PATH: str = ""
+
     # AI
     DEFAULT_GEMINI_MODEL: str = "gemma-3-27b-it"
     GEMINI_API_KEY: str | None = None

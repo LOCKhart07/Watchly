@@ -50,6 +50,7 @@ app = FastAPI(
     description="Stremio catalog addon for movie and series recommendations",
     version=__version__,
     lifespan=lifespan,
+    root_path=settings.ROOT_PATH,
     docs_url=None if settings.APP_ENV != "development" else "/docs",
     redoc_url=None if settings.APP_ENV != "development" else "/redoc",
 )
@@ -128,6 +129,7 @@ async def configure_page(request: Request, _token: str | None = None):
         app_version=__version__,
         total_users=total_users,
         app_host=settings.HOST_NAME,
+        root_path=settings.ROOT_PATH,
         announcement_html=settings.ANNOUNCEMENT_HTML or "",
         languages=languages,
         default_catalogs=default_catalogs,

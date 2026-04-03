@@ -269,7 +269,7 @@ async function fetchStremioIdentity(authKey) {
     if (geminiApiKeyInput) {
         payload.gemini_api_key = geminiApiKeyInput.value.trim();
     }
-    const res = await fetch('/tokens/stremio-identity', {
+    const res = await fetch(`${window.ROOT_PATH}/tokens/stremio-identity`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)

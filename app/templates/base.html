@@ -7,9 +7,10 @@
     <meta name="description"
         content="Stremio catalog addon that provides personalized movie and series recommendations based on your library.">
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="icon" href="/app/static/logo.png" type="image/png">
+    <link rel="icon" href="{{ root_path }}/app/static/logo.png" type="image/png">
     <script>
         window.APP_HOST = "{{ app_host }}";
+        window.ROOT_PATH = "{{ root_path }}";
         tailwind.config = {
             darkMode: 'class',
             theme: {
@@ -297,6 +298,6 @@
         window.MOVIE_GENRES = {{ movie_genres | tojson }};
         window.SERIES_GENRES = {{ series_genres | tojson }};
     </script>
-    <script type="module" src="/app/static/js/main.js"></script>
+    <script type="module" src="{{ root_path }}/app/static/js/main.js"></script>
 </body>
 </html>
