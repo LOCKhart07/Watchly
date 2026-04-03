@@ -1,3 +1,5 @@
+import asyncio
+import time
 from typing import Any
 
 from fastapi import HTTPException
@@ -16,8 +18,14 @@ from app.services.user_cache import user_cache
 from app.utils.catalog import cache_profile_and_watched_sets, sort_catalogs
 
 
+MANIFEST_FRESH_TTL = 3600  # 1 hour — serve cached manifest without rebuilding
+
+
 class ManifestService:
     """Service for generating Stremio manifest files."""
+
+    def __init__(self):
+        self._rebuilding_manifests: set[str] = set()
 
     @staticmethod
     def get_base_manifest() -> dict[str, Any]:
@@ -166,20 +174,34 @@ class ManifestService:
     async def get_manifest_for_token(self, token: str) -> dict[str, Any]:
         """
         Generate manifest for a given token.
-
-        Args:
-            token: User token
-
-        Returns:
-            Complete manifest dictionary
-
-        Raises:
-            HTTPException: If token is invalid or credentials are missing
+        Uses stale-while-revalidate: serves cached manifest immediately,
+        rebuilds in background when stale.
         """
         if not token:
             raise HTTPException(status_code=401, detail="Missing token. Please reconfigure the addon.")
 
-        # Load user credentials and settings
+        # Check cache first
+        cached = await user_cache.get_manifest(token)
+        if cached:
+            manifest, created_at = cached
+            age = int(time.time()) - created_at
+            if age < MANIFEST_FRESH_TTL:
+                logger.debug(f"[{redact_token(token)}] Serving fresh cached manifest (age: {age}s)")
+                return manifest
+
+            # Stale — serve immediately, rebuild in background
+            logger.info(f"[{redact_token(token)}] Serving stale manifest (age: {age}s), scheduling background rebuild")
+            if token not in self._rebuilding_manifests:
+                self._rebuilding_manifests.add(token)
+                asyncio.create_task(self._rebuild_manifest(token))
+            return manifest
+
+        # No cache — build synchronously
+        logger.info(f"[{redact_token(token)}] No cached manifest, building from scratch")
+        return await self._build_manifest(token)
+
+    async def _build_manifest(self, token: str) -> dict[str, Any]:
+        """Build manifest from scratch and cache the result."""
         creds = await token_store.get_user_data(token)
         if not creds:
             raise HTTPException(status_code=401, detail="Token not found. Please reconfigure the addon.")
@@ -197,9 +219,7 @@ class ManifestService:
         bundle = StremioBundle()
         fetched_catalogs = []
         try:
-            # Resolve auth key
             auth_key = await self._resolve_auth_key(bundle, creds, token)
-
             if auth_key:
                 fetched_catalogs = await self._build_dynamic_catalogs(bundle, auth_key, user_settings, token)
         except Exception as e:
@@ -208,20 +228,29 @@ class ManifestService:
         finally:
             await bundle.close()
 
-        # Combine base catalogs with fetched catalogs
         all_catalogs = [c.copy() for c in base_manifest["catalogs"]] + [c.copy() for c in fetched_catalogs]
 
-        # Translate catalogs
         language = user_settings.language if user_settings else None
         translated_catalogs = await self._translate_catalogs(all_catalogs, language)
-
-        # Sort catalogs
         sorted_catalogs = self._sort_catalogs(translated_catalogs, user_settings)
 
         if sorted_catalogs:
             base_manifest["catalogs"] = sorted_catalogs
 
+        # Cache the built manifest
+        await user_cache.set_manifest(token, base_manifest)
+        logger.info(f"[{redact_token(token)}] Manifest built and cached")
+
         return base_manifest
+
+    async def _rebuild_manifest(self, token: str) -> None:
+        """Rebuild manifest in the background."""
+        try:
+            await self._build_manifest(token)
+        except Exception as e:
+            logger.error(f"[{redact_token(token)}] Background manifest rebuild failed: {e}")
+        finally:
+            self._rebuilding_manifests.discard(token)
 
 
 manifest_service = ManifestService()

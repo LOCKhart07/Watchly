@@ -5,7 +5,7 @@ from typing import Any
 
 from loguru import logger
 
-from app.core.constants import CATALOG_KEY, LIBRARY_ITEMS_KEY, PROFILE_KEY, WATCHED_SETS_KEY
+from app.core.constants import CATALOG_KEY, LIBRARY_ITEMS_KEY, MANIFEST_KEY, PROFILE_KEY, WATCHED_SETS_KEY
 from app.core.security import redact_token
 from app.models.taste_profile import TasteProfile
 from app.services.redis_service import redis_service
@@ -420,6 +420,32 @@ class UserCacheService:
             logger.debug(f"[{redact_token(token)}...] Invalidated {deleted_count} catalog cache(s)")
         else:
             logger.debug(f"[{redact_token(token)}...] No catalog caches found to invalidate")
+
+
+    # Manifest Methods
+
+    async def get_manifest(self, token: str) -> tuple[dict[str, Any], int] | None:
+        """Get cached manifest for a user. Returns (manifest_dict, created_at) or None."""
+        key = MANIFEST_KEY.format(token=token)
+        raw = await redis_service.get(key)
+        if raw:
+            try:
+                wrapped = json.loads(raw)
+                return wrapped["data"], wrapped["created_at"]
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Failed to decode cached manifest for {redact_token(token)}: {e}")
+                return None
+        return None
+
+    async def set_manifest(self, token: str, manifest: dict[str, Any], ttl: int = 86400) -> None:
+        """Cache manifest for a user."""
+        key = MANIFEST_KEY.format(token=token)
+        wrapped_data = {
+            "data": manifest,
+            "created_at": int(time.time()),
+        }
+        await redis_service.set(key, json.dumps(wrapped_data), ttl)
+        logger.debug(f"[{redact_token(token)}...] Cached manifest")
 
 
 user_cache = UserCacheService()

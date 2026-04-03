@@ -1,5 +1,6 @@
 import asyncio
 import random
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -144,39 +145,51 @@ class DynamicCatalogService:
         async def _generate_for_type(media_type: str, genres: list[int]):
             logger.info(f"[Theme Catalogs] _generate_for_type called for {media_type}")
 
-            # Build profile using new system
-            profile, _, _ = await self.profile_integration.build_profile_from_library(
-                library_items, media_type, None, None
-            )
-            if not profile:
-                logger.warning(f"Failed to build profile for {media_type}")
-                return media_type, []
+            profile = None
 
-            # Generate interest summary if API key is present.
-            if gemini_api_key and token:
-                try:
-                    logger.info(f"Generating interest summary for {media_type}...")
-                    summary = await interest_summary_service.generate_summary(profile, gemini_api_key)
-                    if summary:
-                        profile.interest_summary = summary
-                        logger.info(f"Interest summary generated for {media_type}: {summary[:80]}...")
-                    else:
-                        logger.warning(f"Interest summary generation returned empty for {media_type}")
-                except Exception as e:
-                    logger.warning(f"Failed to generate interest summary for {media_type}: {e}")
-            else:
-                logger.info(
-                    f"[Theme Catalogs] Skipping summary: gemini_api_key={'SET' if gemini_api_key else 'NONE'},"
-                    f" token={'SET' if token else 'NONE'}"
-                )
-
-            # Always save the updated profile (with or without summary)
+            # Try to reuse cached profile if recent enough (< 1 hour)
             if token:
-                try:
-                    await user_cache.set_profile(token, media_type, profile)
-                    logger.info(f"Saved profile for {media_type} (has_summary={profile.interest_summary is not None})")
-                except Exception as e:
-                    logger.warning(f"Failed to save profile for {media_type}: {e}")
+                cached_profile = await user_cache.get_profile(token, media_type)
+                if cached_profile and cached_profile.interest_summary:
+                    build_time = await user_cache.get_last_profile_build_time(token, media_type)
+                    if build_time and (time.time() - build_time) < 3600:
+                        logger.info(f"Reusing cached profile for {media_type} (age: {int(time.time() - build_time)}s)")
+                        profile = cached_profile
+
+            # Build fresh profile if no usable cache
+            if not profile:
+                profile, _, _ = await self.profile_integration.build_profile_from_library(
+                    library_items, media_type, None, None
+                )
+                if not profile:
+                    logger.warning(f"Failed to build profile for {media_type}")
+                    return media_type, []
+
+                # Generate interest summary if API key is present
+                if gemini_api_key and token:
+                    try:
+                        logger.info(f"Generating interest summary for {media_type}...")
+                        summary = await interest_summary_service.generate_summary(profile, gemini_api_key)
+                        if summary:
+                            profile.interest_summary = summary
+                            logger.info(f"Interest summary generated for {media_type}: {summary[:80]}...")
+                        else:
+                            logger.warning(f"Interest summary generation returned empty for {media_type}")
+                    except Exception as e:
+                        logger.warning(f"Failed to generate interest summary for {media_type}: {e}")
+                else:
+                    logger.info(
+                        f"[Theme Catalogs] Skipping summary: gemini_api_key={'SET' if gemini_api_key else 'NONE'},"
+                        f" token={'SET' if token else 'NONE'}"
+                    )
+
+                # Save the updated profile
+                if token:
+                    try:
+                        await user_cache.set_profile(token, media_type, profile)
+                        logger.info(f"Saved profile for {media_type} (has_summary={profile.interest_summary is not None})")
+                    except Exception as e:
+                        logger.warning(f"Failed to save profile for {media_type}: {e}")
 
             try:
                 catalogs = await self.row_generator.generate_rows(profile, media_type, api_key=gemini_api_key)
