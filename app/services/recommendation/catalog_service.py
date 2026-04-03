@@ -1,3 +1,4 @@
+import asyncio
 import random
 import re
 import time
@@ -82,7 +83,7 @@ def _clean_meta(meta: dict) -> dict | None:
 
 class CatalogService:
     def __init__(self):
-        pass
+        self._rebuilding: set[str] = set()
 
     async def get_catalog(
         self, token: str, content_type: str, catalog_id: str
@@ -133,39 +134,51 @@ class CatalogService:
                 # continue with the request even if the auto update fails
                 pass
 
-        bundle = StremioBundle()
         user_settings = None
-        stale_data = None
 
+        # Check cache first — return early without creating bundle/connections
+        cached_result = await user_cache.get_catalog(token, content_type, catalog_id)
+
+        if cached_result:
+            data, created_at = cached_result
+            age = int(time.time()) - created_at
+
+            # If data is fresh enough (within refresh interval), return it
+            if age < settings.CATALOG_REFRESH_INTERVAL_SECONDS:
+                logger.debug(f"[{redact_token(token)}...] Using cached catalog for {content_type}/{catalog_id}")
+                user_settings = self._extract_settings(credentials)
+                meta_data = data["metas"]
+                meta_data = shuffle_data_if_needed(user_settings, catalog_id, meta_data)
+                data["metas"] = meta_data
+                return data, headers
+
+            # Stale-while-revalidate: return stale data immediately, rebuild in background
+            logger.info(
+                f"[{redact_token(token)}...] Serving stale catalog (age: {age}s) for {content_type}/{catalog_id},"
+                " scheduling background refresh"
+            )
+            user_settings = self._extract_settings(credentials)
+            meta_data = data["metas"]
+            meta_data = shuffle_data_if_needed(user_settings, catalog_id, meta_data)
+            data["metas"] = meta_data
+
+            rebuild_key = f"{token}:{content_type}:{catalog_id}"
+            if rebuild_key not in self._rebuilding:
+                self._rebuilding.add(rebuild_key)
+                asyncio.create_task(
+                    self._rebuild_catalog(token, credentials, content_type, catalog_id, rebuild_key)
+                )
+
+            return data, headers
+
+        # No cache at all — must build from scratch
+        logger.info(
+            f"[{redact_token(token)}...] Catalog not cached for {content_type}/{catalog_id}, building from"
+            " scratch"
+        )
+
+        bundle = StremioBundle()
         try:
-            # get cached catalog
-            cached_result = await user_cache.get_catalog(token, content_type, catalog_id)
-
-            if cached_result:
-                data, created_at = cached_result
-                age = int(time.time()) - created_at
-
-                # If data is fresh enough (within refresh interval), return it
-                if age < settings.CATALOG_REFRESH_INTERVAL_SECONDS:
-                    logger.debug(f"[{redact_token(token)}...] Using cached catalog for {content_type}/{catalog_id}")
-                    # Try to extract settings from credentials for shuffling, even on cached path
-                    user_settings = self._extract_settings(credentials)
-                    meta_data = data["metas"]
-                    meta_data = shuffle_data_if_needed(user_settings, catalog_id, meta_data)
-                    data["metas"] = meta_data
-                    return data, headers
-
-                # If data is stale, keep it for fallback
-                stale_data = data
-                logger.info(
-                    f"[{redact_token(token)}...] Catalog is stale (age: {age}s) for {content_type}/{catalog_id},"
-                    "refreshing..."
-                )
-            else:
-                logger.info(
-                    f"[{redact_token(token)}...] Catalog not cached for {content_type}/{catalog_id}, building from"
-                    " scratch"
-                )
 
             # Resolve auth and settings
             auth_key = await self._resolve_auth(bundle, credentials, token)
@@ -258,24 +271,77 @@ class CatalogService:
 
         except Exception as e:
             logger.error(f"[{redact_token(token)}...] Failed to generate catalog: {e}")
-
-            # Fallback 1: Return Stale Data if available
-            if stale_data:
-                logger.warning(
-                    f"[{redact_token(token)}...] Serving stale content for {content_type}/{catalog_id} due to error"
-                )
-                # Shuffle stale data too if needed
-                user_settings = user_settings or self._extract_settings(credentials)
-                meta_data = stale_data.get("metas", [])
-                meta_data = shuffle_data_if_needed(user_settings, catalog_id, meta_data)
-                stale_data["metas"] = meta_data
-                return stale_data, headers
-
-            # Fallback 2: Return Empty (prevents 500 error)
             return {"metas": []}, headers
 
         finally:
             await bundle.close()
+
+    async def _rebuild_catalog(
+        self, token: str, credentials: dict[str, Any], content_type: str, catalog_id: str, rebuild_key: str
+    ) -> None:
+        """Rebuild a catalog in the background and update the Redis cache."""
+        bundle = StremioBundle()
+        try:
+            auth_key = await self._resolve_auth(bundle, credentials, token)
+            user_settings = self._extract_settings(credentials)
+            language = user_settings.language if user_settings else "en-US"
+
+            library_items = await user_cache.get_library_items(token)
+            if not library_items:
+                library_items = await bundle.library.get_library_items(auth_key)
+                await user_cache.set_library_items(token, library_items)
+
+            services = self._initialize_services(language, user_settings)
+            integration_service: ProfileIntegration = services["integration"]
+
+            cached_data = await user_cache.get_profile_and_watched_sets(token, content_type)
+            if cached_data:
+                profile, watched_tmdb, watched_imdb = cached_data
+            else:
+                profile, watched_tmdb, watched_imdb = await cache_profile_and_watched_sets(
+                    token, content_type, integration_service, library_items, bundle, auth_key,
+                )
+
+            whitelist = await integration_service.get_genre_whitelist(profile, content_type) if profile else set()
+
+            recommendations = await self._get_recommendations(
+                catalog_id=catalog_id,
+                content_type=content_type,
+                services=services,
+                profile=profile,
+                watched_tmdb=watched_tmdb,
+                watched_imdb=watched_imdb,
+                whitelist=whitelist,
+                library_items=library_items,
+                limit=DEFAULT_CATALOG_LIMIT,
+                user_settings=user_settings,
+            )
+
+            if recommendations and len(recommendations) < DEFAULT_MIN_ITEMS:
+                recommendations = await pad_to_min(
+                    content_type, recommendations, DEFAULT_MIN_ITEMS,
+                    services["tmdb"], user_settings, watched_tmdb, watched_imdb,
+                )
+
+            cleaned = [_clean_meta(m) for m in recommendations]
+            cleaned = [m for m in cleaned if m is not None]
+
+            if cleaned:
+                data = {"metas": cleaned}
+                await user_cache.set_catalog(token, content_type, catalog_id, data, settings.CATALOG_STALE_TTL)
+                logger.info(
+                    f"[{redact_token(token)}...] Background rebuild complete for {content_type}/{catalog_id}"
+                    f" ({len(cleaned)} items)"
+                )
+            else:
+                logger.warning(
+                    f"[{redact_token(token)}...] Background rebuild returned empty for {content_type}/{catalog_id}"
+                )
+        except Exception as e:
+            logger.error(f"[{redact_token(token)}...] Background rebuild failed for {content_type}/{catalog_id}: {e}")
+        finally:
+            await bundle.close()
+            self._rebuilding.discard(rebuild_key)
 
     def _validate_inputs(self, token: str, content_type: str, catalog_id: str) -> None:
         if not token:
