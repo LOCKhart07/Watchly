@@ -50,7 +50,6 @@ app = FastAPI(
     description="Stremio catalog addon for movie and series recommendations",
     version=__version__,
     lifespan=lifespan,
-    root_path=settings.ROOT_PATH,
     docs_url=None if settings.APP_ENV != "development" else "/docs",
     redoc_url=None if settings.APP_ENV != "development" else "/redoc",
 )
