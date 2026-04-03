@@ -238,16 +238,15 @@ class CatalogService:
             whitelist = await integration_service.get_genre_whitelist(profile, profile_type) if profile else set()
 
             if content_type == "anime":
-                # Fetch from both movie and series, merge, then filter to Animation
-                all_recs = []
-                for ct in ("movie", "series"):
+                # Fetch from both movie and series in parallel, merge, then filter to Animation
+                async def _fetch_anime_recs(ct: str):
                     ct_profile_data = await user_cache.get_profile_and_watched_sets(token, ct)
                     if ct_profile_data:
                         ct_profile, ct_watched_tmdb, ct_watched_imdb = ct_profile_data
                     else:
                         ct_profile, ct_watched_tmdb, ct_watched_imdb = profile, watched_tmdb, watched_imdb
                     ct_whitelist = await integration_service.get_genre_whitelist(ct_profile, ct) if ct_profile else set()
-                    recs = await self._get_recommendations(
+                    return await self._get_recommendations(
                         catalog_id=catalog_id,
                         content_type=ct,
                         services=services,
@@ -259,9 +258,12 @@ class CatalogService:
                         limit=DEFAULT_CATALOG_LIMIT,
                         user_settings=user_settings,
                     )
-                    all_recs.extend(recs)
+
+                movie_recs, series_recs = await asyncio.gather(
+                    _fetch_anime_recs("movie"), _fetch_anime_recs("series")
+                )
                 recommendations = [
-                    r for r in all_recs
+                    r for r in [*movie_recs, *series_recs]
                     if ANIME_GENRE_ID in (r.get("genre_ids") or r.get("genres") or [])
                 ]
             else:
@@ -345,15 +347,14 @@ class CatalogService:
             whitelist = await integration_service.get_genre_whitelist(profile, profile_type) if profile else set()
 
             if content_type == "anime":
-                all_recs = []
-                for ct in ("movie", "series"):
+                async def _fetch_anime_recs(ct: str):
                     ct_profile_data = await user_cache.get_profile_and_watched_sets(token, ct)
                     if ct_profile_data:
                         ct_profile, ct_watched_tmdb, ct_watched_imdb = ct_profile_data
                     else:
                         ct_profile, ct_watched_tmdb, ct_watched_imdb = profile, watched_tmdb, watched_imdb
                     ct_whitelist = await integration_service.get_genre_whitelist(ct_profile, ct) if ct_profile else set()
-                    recs = await self._get_recommendations(
+                    return await self._get_recommendations(
                         catalog_id=catalog_id,
                         content_type=ct,
                         services=services,
@@ -365,9 +366,12 @@ class CatalogService:
                         limit=DEFAULT_CATALOG_LIMIT,
                         user_settings=user_settings,
                     )
-                    all_recs.extend(recs)
+
+                movie_recs, series_recs = await asyncio.gather(
+                    _fetch_anime_recs("movie"), _fetch_anime_recs("series")
+                )
                 recommendations = [
-                    r for r in all_recs
+                    r for r in [*movie_recs, *series_recs]
                     if ANIME_GENRE_ID in (r.get("genre_ids") or r.get("genres") or [])
                 ]
             else:
