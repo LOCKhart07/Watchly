@@ -8,7 +8,7 @@ from app.services.recommendation.metadata import RecommendationMetadata
 
 
 def content_type_to_mtype(content_type: str) -> str:
-    return "tv" if content_type in ("tv", "series") else "movie"
+    return "tv" if content_type in ("tv", "series", "anime") else "movie"
 
 
 async def resolve_tmdb_id(item_id: str, tmdb_service: Any) -> int | None:

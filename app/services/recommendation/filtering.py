@@ -169,7 +169,7 @@ class RecommendationFiltering:
             return []
         if content_type == "movie":
             return [int(g) for g in user_settings.excluded_movie_genres]
-        elif content_type in ["series", "tv"]:
+        elif content_type in ["series", "tv", "anime"]:
             return [int(g) for g in user_settings.excluded_series_genres]
         return []
 

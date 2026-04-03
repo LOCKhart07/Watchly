@@ -29,6 +29,8 @@ def get_catalogs_from_config(
             catalogs.append({"type": "movie", "id": cat_id, "name": name, "extra": extra})
         if enabled_series:
             catalogs.append({"type": "series", "id": cat_id, "name": name, "extra": extra})
+        if cat_id == "watchly.rec" and (enabled_movie or enabled_series):
+            catalogs.append({"type": "anime", "id": cat_id, "name": "Anime Picks", "extra": extra})
     return catalogs
 
 

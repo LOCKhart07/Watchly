@@ -81,9 +81,17 @@ def _clean_meta(meta: dict) -> dict | None:
     return cleaned
 
 
+ANIME_GENRE_ID = 16
+
+
 class CatalogService:
     def __init__(self):
         self._rebuilding: set[str] = set()
+
+    @staticmethod
+    def _normalize_content_type(content_type: str) -> str:
+        """Map anime to series for internal TMDB/cache operations."""
+        return "series" if content_type == "anime" else content_type
 
     async def get_catalog(
         self, token: str, content_type: str, catalog_id: str
@@ -201,50 +209,81 @@ class CatalogService:
             services = self._initialize_services(language, user_settings)
             integration_service: ProfileIntegration = services["integration"]
 
+            # Use normalized type for profile lookups (anime reuses series profile)
+            profile_type = self._normalize_content_type(content_type)
+
             # Try to get cached profile and watched sets
-            cached_data = await user_cache.get_profile_and_watched_sets(token, content_type)
+            cached_data = await user_cache.get_profile_and_watched_sets(token, profile_type)
 
             if cached_data:
                 # Use cached profile and watched sets
                 profile, watched_tmdb, watched_imdb = cached_data
-                logger.debug(f"[{redact_token(token)}...] Using cached profile and watched sets for {content_type}")
+                logger.debug(f"[{redact_token(token)}...] Using cached profile and watched sets for {profile_type}")
             else:
                 # Build profile if not cached
-                logger.info(f"[{redact_token(token)}...] Profile not cached for {content_type}, building from library")
+                logger.info(f"[{redact_token(token)}...] Profile not cached for {profile_type}, building from library")
                 (
                     profile,
                     watched_tmdb,
                     watched_imdb,
                 ) = await cache_profile_and_watched_sets(
                     token,
-                    content_type,
+                    profile_type,
                     integration_service,
                     library_items,
                     bundle,
                     auth_key,
                 )
 
-            whitelist = await integration_service.get_genre_whitelist(profile, content_type) if profile else set()
+            whitelist = await integration_service.get_genre_whitelist(profile, profile_type) if profile else set()
 
-            # Route to appropriate recommendation service
-            recommendations = await self._get_recommendations(
-                catalog_id=catalog_id,
-                content_type=content_type,
-                services=services,
-                profile=profile,
-                watched_tmdb=watched_tmdb,
-                watched_imdb=watched_imdb,
-                whitelist=whitelist,
-                library_items=library_items,
-                limit=DEFAULT_CATALOG_LIMIT,
-                user_settings=user_settings,
-            )
+            if content_type == "anime":
+                # Fetch from both movie and series, merge, then filter to Animation
+                all_recs = []
+                for ct in ("movie", "series"):
+                    ct_profile_data = await user_cache.get_profile_and_watched_sets(token, ct)
+                    if ct_profile_data:
+                        ct_profile, ct_watched_tmdb, ct_watched_imdb = ct_profile_data
+                    else:
+                        ct_profile, ct_watched_tmdb, ct_watched_imdb = profile, watched_tmdb, watched_imdb
+                    ct_whitelist = await integration_service.get_genre_whitelist(ct_profile, ct) if ct_profile else set()
+                    recs = await self._get_recommendations(
+                        catalog_id=catalog_id,
+                        content_type=ct,
+                        services=services,
+                        profile=ct_profile,
+                        watched_tmdb=ct_watched_tmdb,
+                        watched_imdb=ct_watched_imdb,
+                        whitelist=ct_whitelist,
+                        library_items=library_items,
+                        limit=DEFAULT_CATALOG_LIMIT,
+                        user_settings=user_settings,
+                    )
+                    all_recs.extend(recs)
+                recommendations = [
+                    r for r in all_recs
+                    if ANIME_GENRE_ID in (r.get("genre_ids") or r.get("genres") or [])
+                ]
+            else:
+                # Route to appropriate recommendation service
+                recommendations = await self._get_recommendations(
+                    catalog_id=catalog_id,
+                    content_type=profile_type,
+                    services=services,
+                    profile=profile,
+                    watched_tmdb=watched_tmdb,
+                    watched_imdb=watched_imdb,
+                    whitelist=whitelist,
+                    library_items=library_items,
+                    limit=DEFAULT_CATALOG_LIMIT,
+                    user_settings=user_settings,
+                )
 
             # Pad if needed to meet minimum of 8 items
             # # TODO: This is risky because it can fetch too many unrelated items.
             if recommendations and len(recommendations) < DEFAULT_MIN_ITEMS:
                 recommendations = await pad_to_min(
-                    content_type,
+                    profile_type,
                     recommendations,
                     DEFAULT_MIN_ITEMS,
                     services["tmdb"],
@@ -280,6 +319,7 @@ class CatalogService:
         self, token: str, credentials: dict[str, Any], content_type: str, catalog_id: str, rebuild_key: str
     ) -> None:
         """Rebuild a catalog in the background and update the Redis cache."""
+        profile_type = self._normalize_content_type(content_type)
         bundle = StremioBundle()
         try:
             auth_key = await self._resolve_auth(bundle, credentials, token)
@@ -294,32 +334,59 @@ class CatalogService:
             services = self._initialize_services(language, user_settings)
             integration_service: ProfileIntegration = services["integration"]
 
-            cached_data = await user_cache.get_profile_and_watched_sets(token, content_type)
+            cached_data = await user_cache.get_profile_and_watched_sets(token, profile_type)
             if cached_data:
                 profile, watched_tmdb, watched_imdb = cached_data
             else:
                 profile, watched_tmdb, watched_imdb = await cache_profile_and_watched_sets(
-                    token, content_type, integration_service, library_items, bundle, auth_key,
+                    token, profile_type, integration_service, library_items, bundle, auth_key,
                 )
 
-            whitelist = await integration_service.get_genre_whitelist(profile, content_type) if profile else set()
+            whitelist = await integration_service.get_genre_whitelist(profile, profile_type) if profile else set()
 
-            recommendations = await self._get_recommendations(
-                catalog_id=catalog_id,
-                content_type=content_type,
-                services=services,
-                profile=profile,
-                watched_tmdb=watched_tmdb,
-                watched_imdb=watched_imdb,
-                whitelist=whitelist,
-                library_items=library_items,
-                limit=DEFAULT_CATALOG_LIMIT,
-                user_settings=user_settings,
-            )
+            if content_type == "anime":
+                all_recs = []
+                for ct in ("movie", "series"):
+                    ct_profile_data = await user_cache.get_profile_and_watched_sets(token, ct)
+                    if ct_profile_data:
+                        ct_profile, ct_watched_tmdb, ct_watched_imdb = ct_profile_data
+                    else:
+                        ct_profile, ct_watched_tmdb, ct_watched_imdb = profile, watched_tmdb, watched_imdb
+                    ct_whitelist = await integration_service.get_genre_whitelist(ct_profile, ct) if ct_profile else set()
+                    recs = await self._get_recommendations(
+                        catalog_id=catalog_id,
+                        content_type=ct,
+                        services=services,
+                        profile=ct_profile,
+                        watched_tmdb=ct_watched_tmdb,
+                        watched_imdb=ct_watched_imdb,
+                        whitelist=ct_whitelist,
+                        library_items=library_items,
+                        limit=DEFAULT_CATALOG_LIMIT,
+                        user_settings=user_settings,
+                    )
+                    all_recs.extend(recs)
+                recommendations = [
+                    r for r in all_recs
+                    if ANIME_GENRE_ID in (r.get("genre_ids") or r.get("genres") or [])
+                ]
+            else:
+                recommendations = await self._get_recommendations(
+                    catalog_id=catalog_id,
+                    content_type=profile_type,
+                    services=services,
+                    profile=profile,
+                    watched_tmdb=watched_tmdb,
+                    watched_imdb=watched_imdb,
+                    whitelist=whitelist,
+                    library_items=library_items,
+                    limit=DEFAULT_CATALOG_LIMIT,
+                    user_settings=user_settings,
+                )
 
             if recommendations and len(recommendations) < DEFAULT_MIN_ITEMS:
                 recommendations = await pad_to_min(
-                    content_type, recommendations, DEFAULT_MIN_ITEMS,
+                    profile_type, recommendations, DEFAULT_MIN_ITEMS,
                     services["tmdb"], user_settings, watched_tmdb, watched_imdb,
                 )
 
@@ -350,9 +417,9 @@ class CatalogService:
                 detail="Missing credentials token. Please open Watchly from a configured manifest URL.",
             )
 
-        if content_type not in ["movie", "series"]:
+        if content_type not in ["movie", "series", "anime"]:
             logger.warning(f"Invalid type: {content_type}")
-            raise HTTPException(status_code=400, detail="Invalid type. Use 'movie' or 'series'")
+            raise HTTPException(status_code=400, detail="Invalid type. Use 'movie', 'series', or 'anime'")
 
         # Supported IDs
         supported_base = [
